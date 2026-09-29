@@ -14,8 +14,10 @@ runs `xcodegen generate` in `apps/ios/OuraApp/`.
 ## One-time setup
 
 **1. An app record.** App Store Connect → **Apps** → **+** → **New App**, with the
-bundle id `md.thomas.openoura`. Creating it needs the App Manager, Admin or Account
-Holder role (or the *Create Apps* permission).
+bundle id `engineer.evanlee.openoura`. Creating it needs the App Manager, Admin or
+Account Holder role (or the *Create Apps* permission). Changing this later means
+registering a new App ID first — identifiers cannot be renamed in the developer
+portal.
 
 **2. Authorize the repository.** App Store Connect → your app → **Xcode Cloud** tab,
 add the GitHub source, then approve the *Xcode Cloud* GitHub App on
