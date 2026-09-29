@@ -11,7 +11,7 @@ BUILD="$APPDIR/build"
 APP="$BUILD/OuraApp.app"
 TRIPLE="arm64-apple-ios17.0-simulator"
 DEV="${1:-Codex-iPhone-17}"
-BUNDLE_ID="md.thomas.openoura"
+BUNDLE_ID="engineer.evanlee.openoura"
 
 echo "==> refresh xcframework staticlib (release, iOS sim)"
 cargo build -p oura-core --release --target aarch64-apple-ios-sim >/dev/null

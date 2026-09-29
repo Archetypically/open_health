@@ -14,7 +14,7 @@ BUILD="$APPDIR/build"
 APP="$BUILD/OuraApp.app"
 TRIPLE="arm64-apple-ios17.0-simulator"
 DEV="${1:-Codex-iPhone-17}"
-BUNDLE_ID="md.thomas.openoura"
+BUNDLE_ID="engineer.evanlee.openoura"
 
 [ -d "$LT/lib" ] || { echo "missing libtorch iOS at $LT (run apps/ios/spike/build_libtorch_ios.sh)"; exit 1; }
 

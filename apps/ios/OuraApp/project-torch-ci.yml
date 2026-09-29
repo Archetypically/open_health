@@ -10,7 +10,7 @@
 # See apps/ios/XCODE_CLOUD.md.
 name: OuraApp
 options:
-  bundleIdPrefix: md.thomas
+  bundleIdPrefix: engineer.evanlee
   deploymentTarget:
     iOS: "17.0"
   createIntermediateGroups: true
@@ -33,7 +33,7 @@ settings:
     # ci_post_clone.sh exports CI_BUILD_NUMBER; xcodegen expands ${VAR} in the spec.
     # Never hardcode this — TestFlight rejects a build number it has already seen.
     CURRENT_PROJECT_VERSION: "${CI_BUILD_NUMBER}"
-    PRODUCT_BUNDLE_IDENTIFIER: md.thomas.openoura
+    PRODUCT_BUNDLE_IDENTIFIER: engineer.evanlee.openoura
     TARGETED_DEVICE_FAMILY: "1"   # iPhone only (no iPad multitasking orientation reqs)
     CODE_SIGN_STYLE: Automatic
     CODE_SIGN_ENTITLEMENTS: OuraApp.entitlements
