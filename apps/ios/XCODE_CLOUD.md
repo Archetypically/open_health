@@ -18,11 +18,10 @@ bundle id `md.thomas.openoura`. Creating it needs the App Manager, Admin or Acco
 Holder role (or the *Create Apps* permission).
 
 **2. Authorize the repository.** App Store Connect → your app → **Xcode Cloud** tab,
-add the GitHub source. GitHub then asks to install the *Xcode Cloud* GitHub App on
-`Th0rgal/open_health`. **Only the owner of that GitHub account can approve it** —
-GitHub requires admin on the owning account, and `Th0rgal` is a personal account,
-not an org you administer. A contributor cannot connect the repo alone; if that
-authorization is not available, the pipeline has to live in a repo you own instead.
+add the GitHub source, then approve the *Xcode Cloud* GitHub App on
+`Archetypically/open_health` — your own fork. That approval is the whole reason for
+the fork: GitHub requires admin on the account that owns the repo, and upstream
+`Th0rgal/open_health` is a personal account you do not control.
 
 **3. Create the first workflow in Xcode, not in App Store Connect.** Apple requires
 the initial setup in Xcode, and it needs a project window — so generate one first,
@@ -38,7 +37,7 @@ Then **Product → Xcode Cloud → Create Workflow…** and fill in:
 |---|---|
 | General | name it; tick **Restrict editing** (required for review-eligible builds) |
 | Environment | macOS + Xcode versions; add the env vars from the torch section below, ticking **Keep value redacted** for the token |
-| Start Conditions | **Branch Changes** on `main` (leave *Auto-cancel Builds* on) |
+| Start Conditions | **Branch Changes** on `customizations` (leave *Auto-cancel Builds* on) |
 | Actions | **Archive** → scheme `OuraApp`, platform iOS → *TestFlight (Internal Testing Only)* |
 | Post-actions | **TestFlight** → Internal, and add yourself as a tester |
 
@@ -46,7 +45,31 @@ Then **Product → Xcode Cloud → Create Workflow…** and fill in:
 mode `755`, which Xcode Cloud requires. After the first successful build you can edit
 and create workflows in **App Store Connect → your app → Xcode Cloud** instead.
 
-That is it — each merge to `main` produces a TestFlight build.
+That is it — each push to `customizations` produces a TestFlight build.
+
+## Repository layout
+
+`Archetypically/open_health` is a public fork of `Th0rgal/open_health` inside its
+fork network, so GitHub keeps `main` in sync with upstream on its own — that is also
+what makes the **Sync fork** button work. Your work is not on `main`:
+
+| branch | contents |
+|---|---|
+| `main` | upstream's history only; auto-synced, never committed to by hand |
+| `customizations` | your commits, currently one ahead of `main` |
+
+That is why the start condition above is a push to `customizations`. When upstream
+moves, bring it forward from that branch:
+
+```bash
+git fetch upstream
+git rebase upstream/main                    # on customizations
+git push --force-with-lease origin customizations
+```
+
+Rebasing keeps your commits linear instead of accumulating merge commits. The
+trade-off: an auto-synced `main` never goes through CI, so upstream commits land
+unbuilt — only your pushes to `customizations` are verified by a build.
 
 ## Build numbers
 
