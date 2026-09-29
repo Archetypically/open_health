@@ -1,12 +1,18 @@
 #!/bin/bash
-# Package the device + simulator libtorch builds into xcframeworks, wrapping each dylib
-# in a proper .framework bundle — the App Store rejects bare embedded .dylib files
+# Package the libtorch builds into xcframeworks, wrapping each dylib in a proper
+# .framework bundle — the App Store rejects bare embedded .dylib files
 # (ITMS-90426 "SwiftSupport folder is missing" / invalid bundle), it wants dynamic libs
-# inside frameworks. Xcode then picks the right slice per SDK and embeds+signs them.
+# inside frameworks. Xcode then embeds+signs them.
 #
-# Prereq: build BOTH slices first —
-#   apps/ios/spike/build_libtorch_ios.sh          # simulator → build_ios/install
-#   apps/ios/spike/build_libtorch_ios.sh device   # device    → build_ios_device/install
+# Prereq: build the DEVICE slice —
+#   apps/ios/spike/build_libtorch_ios.sh device   # device → build_ios_device/install
+# and, only if you also want simulator builds:
+#   apps/ios/spike/build_libtorch_ios.sh          # sim   → build_ios/install
+#
+# Device-only is enough for an archive / TestFlight build, and is the cheaper path —
+# one multi-hour CMake build instead of two. It yields single-slice xcframeworks, so
+# `build_run_torch.sh` (a simulator harness) will not link against them: local torch
+# debugging then needs the simulator build too.
 #
 # Output: apps/ios/libtorch-xcframeworks/{libtorch,libtorch_cpu,libc10,
 # libtorch_global_deps}.xcframework + include/ (gitignored, local artifact). The whole
@@ -21,9 +27,11 @@ WORK="$REPO/apps/ios/.libtorch-frameworks-build"
 MIN=17.0
 LIBS="libtorch libtorch_cpu libc10 libtorch_global_deps"
 
-for d in "$SIM" "$DEV"; do
-    [ -d "$d" ] || { echo "missing $d — build that slice first"; exit 1; }
-done
+# The device slice is required — an archive cannot link without it. The simulator
+# slice is optional and only adds a second slice to each xcframework.
+[ -d "$DEV" ] || { echo "missing $DEV — run: apps/ios/spike/build_libtorch_ios.sh device"; exit 1; }
+HAVE_SIM=0
+if [ -d "$SIM" ]; then HAVE_SIM=1; else echo "note: no simulator build — packaging device-only"; fi
 
 # Wrap one dylib in a flat iOS .framework: binary named after the framework, install
 # name @rpath/<name>.framework/<name>, inter-lib deps rewritten to the framework paths,
@@ -66,23 +74,31 @@ PLIST
 
 rm -rf "$WORK" "$OUT"; mkdir -p "$WORK/device" "$WORK/sim" "$OUT"
 for name in $LIBS; do
-    echo "==> $name.framework (device + sim) → xcframework"
     make_framework "$DEV/$name.dylib" "$name" "$WORK/device" "iPhoneOS" 2
-    make_framework "$SIM/$name.dylib" "$name" "$WORK/sim"    "iPhoneSimulator" 7
-    xcodebuild -create-xcframework \
-        -framework "$WORK/device/$name.framework" -debug-symbols "$WORK/device/$name.framework.dSYM" \
-        -framework "$WORK/sim/$name.framework"    -debug-symbols "$WORK/sim/$name.framework.dSYM" \
-        -output "$OUT/$name.xcframework" >/dev/null
+    if [ "$HAVE_SIM" = 1 ]; then
+        echo "==> $name.framework (device + sim) → xcframework"
+        make_framework "$SIM/$name.dylib" "$name" "$WORK/sim" "iPhoneSimulator" 7
+        xcodebuild -create-xcframework \
+            -framework "$WORK/device/$name.framework" -debug-symbols "$WORK/device/$name.framework.dSYM" \
+            -framework "$WORK/sim/$name.framework"    -debug-symbols "$WORK/sim/$name.framework.dSYM" \
+            -output "$OUT/$name.xcframework" >/dev/null
+    else
+        echo "==> $name.framework (device only) → xcframework"
+        xcodebuild -create-xcframework \
+            -framework "$WORK/device/$name.framework" -debug-symbols "$WORK/device/$name.framework.dSYM" \
+            -output "$OUT/$name.xcframework" >/dev/null
+    fi
 done
 rm -rf "$WORK"
 
 # The xcframeworks carry binaries + dSYMs only, but TorchBridge.mm compiles against
 # the torch headers, so a vendored CI checkout needs those too — project-torch-ci.yml
 # points SYSTEM_HEADER_SEARCH_PATHS at include/. Both builds generate the same header
-# tree from the same source (build_run_torch.sh already compiles a device triple
-# against the sim build's headers), so one copy serves both slices.
+# tree from the same source, so whichever slice exists serves both.
+INCLUDE_SRC="$LT/build_ios_device/install/include"
+[ "$HAVE_SIM" = 1 ] && INCLUDE_SRC="$LT/build_ios/install/include"
 echo "==> include/ (torch headers, needed by a vendored CI build)"
-cp -R "$LT/build_ios/install/include" "$OUT/include"
+cp -R "$INCLUDE_SRC" "$OUT/include"
 
 echo "==> done:"; ls "$OUT"; du -sh "$OUT"
 echo "==> publish as a single release asset (ci_post_clone.sh untars this):"

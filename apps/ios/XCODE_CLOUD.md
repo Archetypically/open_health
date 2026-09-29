@@ -129,10 +129,16 @@ The CMake build takes hours, so it happens locally, once:
 
 ```bash
 cd apps/ios
-./spike/build_libtorch_ios.sh          # simulator → local/libtorch-ios/pytorch/build_ios
-./spike/build_libtorch_ios.sh device   # device    → …/build_ios_device
-./package-libtorch-xcframeworks.sh     # → apps/ios/libtorch-xcframeworks/ (+ include/, + the tar command)
+./spike/build_libtorch_ios.sh device   # device → local/libtorch-ios/pytorch/build_ios_device
+./package-libtorch-xcframeworks.sh     # → libtorch-xcframeworks/ (+ include/, + the tar command)
 ```
+
+The **device slice alone is enough** for an archive, and it is one multi-hour build
+instead of two. The packaging script takes the device slice as required and the
+simulator slice as optional, producing single-slice xcframeworks when only the device
+build exists. The cost is local debugging: `build_run_torch.sh` is a simulator harness
+and will not link against them, so add `./spike/build_libtorch_ios.sh` (no `device`)
+if you want to run the torch build on the simulator locally.
 
 Attach the resulting `libtorch-xcframeworks.tar.gz` to a release on this repo and
 put its URL in `LIBTORCH_XCFRAMEWORKS_URL`. PyTorch is BSD, so a public asset leaks
