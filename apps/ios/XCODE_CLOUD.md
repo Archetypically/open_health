@@ -80,12 +80,22 @@ unbuilt — only your pushes to `evan/customizations` are verified by a build.
 
 ## Build numbers
 
-Never hardcode `CURRENT_PROJECT_VERSION` in a CI spec: TestFlight rejects a build
-number it has already seen, so a literal means the second run fails to upload.
-`ci_post_clone.sh` stamps `CI_BUILD_NUMBER` from the UTC clock and exports it;
-xcodegen expands `${CI_BUILD_NUMBER}` in the spec. The commit count is not a usable
-source — Xcode Cloud clones shallow, so `rev-list --count` returns 1. The local
-`project.yml` keeps its literal because that path is a manual upload, not CI.
+Never hardcode `CURRENT_PROJECT_VERSION` in a CI spec. TestFlight rejects a build
+number it has already seen for a given marketing version, so a literal means the
+second run fails to upload — and the failure surfaces as a rejected upload, not a
+compile error.
+
+The subtler trap: **Xcode Cloud sets `CI_BUILD_NUMBER` itself**, to a per-workflow
+run counter. A script that merely defaults to its own value inherits that counter,
+and it restarts at 1 for every *new* workflow. Add a second workflow (say, the
+torch one) and its run 1 collides with this workflow's run 1, so TestFlight refuses
+the upload with no obvious cause. `ci_post_clone.sh` therefore overwrites the
+inherited value with a UTC clock stamp, which xcodegen expands as
+`${CI_BUILD_NUMBER}` in the spec.
+
+The commit count is not a usable source either: Xcode Cloud clones shallow, so
+`rev-list --count` returns 1. The local `project.yml` keeps its literal because
+that path is a manual upload, not CI.
 
 ## The model-free build (default)
 
