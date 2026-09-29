@@ -8,7 +8,9 @@
 #   apps/ios/spike/build_libtorch_ios.sh          # simulator → build_ios/install
 #   apps/ios/spike/build_libtorch_ios.sh device   # device    → build_ios_device/install
 #
-# Output: apps/ios/libtorch-xcframeworks/<name>.xcframework (gitignored, local artifact).
+# Output: apps/ios/libtorch-xcframeworks/{libtorch,libtorch_cpu,libc10,
+# libtorch_global_deps}.xcframework + include/ (gitignored, local artifact). The whole
+# directory is what a CI run vendors: tar it and publish as one release asset.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"   # repo root from this script's location
 LT="$REPO/local/libtorch-ios/pytorch"
@@ -73,4 +75,15 @@ for name in $LIBS; do
         -output "$OUT/$name.xcframework" >/dev/null
 done
 rm -rf "$WORK"
-echo "==> done:"; ls "$OUT"
+
+# The xcframeworks carry binaries + dSYMs only, but TorchBridge.mm compiles against
+# the torch headers, so a vendored CI checkout needs those too — project-torch-ci.yml
+# points SYSTEM_HEADER_SEARCH_PATHS at include/. Both builds generate the same header
+# tree from the same source (build_run_torch.sh already compiles a device triple
+# against the sim build's headers), so one copy serves both slices.
+echo "==> include/ (torch headers, needed by a vendored CI build)"
+cp -R "$LT/build_ios/install/include" "$OUT/include"
+
+echo "==> done:"; ls "$OUT"; du -sh "$OUT"
+echo "==> publish as a single release asset (ci_post_clone.sh untars this):"
+echo "    tar -czf libtorch-xcframeworks.tar.gz -C \"$OUT\" ."

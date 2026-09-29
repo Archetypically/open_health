@@ -10,8 +10,9 @@ signing requires *your* Apple Developer account.
 - Install xcodegen: `brew install xcodegen`.
 
 ## Build & upload
-Current upload version is configured as **0.1.1 (27)** in
-`OuraApp/project.yml` and `OuraApp/project-ci.yml`.
+Manual upload version is **0.1.1 (27)**, set in `OuraApp/project.yml`. The CI specs
+never hardcode it — `ci_post_clone.sh` stamps a fresh `CI_BUILD_NUMBER` per run
+(see `XCODE_CLOUD.md`).
 
 ```bash
 # 1. shared Rust core → both device + simulator slices
@@ -70,5 +71,7 @@ older local `.ptl` file.
 - **Signing**: Team ID + a distribution provisioning profile (only you can do this).
 - **Version bumps**: `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` in `project.yml`.
 - **Data**: the local `project.yml` build bundles `oura.db` when that gitignored file is
-  present, which is useful for a personal TestFlight. The Xcode Cloud `project-ci.yml`
-  build does not bundle `oura.db`, `.ptl` models, or LibTorch.
+  present, which is useful for a personal TestFlight. The Xcode Cloud model-free
+  build (`project-ci.yml`) bundles none of `oura.db`, the `.ptl` models, or LibTorch;
+  the opt-in torch build (`project-torch-ci.yml`) fetches the last two at run time
+  and still never bundles the database.

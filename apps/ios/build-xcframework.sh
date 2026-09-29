@@ -6,6 +6,20 @@
 # this produces BOTH slices, which a device build / TestFlight archive needs.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+
+# Linking an iOS dylib needs the real iPhoneOS SDK, which ships only with a full
+# Xcode. If xcode-select still points at bare CommandLineTools, point the tools
+# at an installed Xcode for this script only (no sudo needed).
+if ! xcrun --sdk iphoneos --show-sdk-path >/dev/null 2>&1; then
+  DEV_DIR="$(ls -d /Applications/Xcode*.app/Contents/Developer 2>/dev/null | head -1)"
+  if [ -z "$DEV_DIR" ]; then
+    echo "✗ iPhoneOS SDK not found. Install Xcode, or run:" >&2
+    echo "    sudo xcode-select -s /Applications/Xcode.app/Contents/Developer" >&2
+    exit 1
+  fi
+  export DEVELOPER_DIR="$DEV_DIR"
+  echo "==> DEVELOPER_DIR=$DEV_DIR (xcode-select points at $(xcode-select -p))"
+fi
 REPO="$PWD"
 HEADERS="$REPO/apps/ios/generated/headers"   # UniFFI header + module.modulemap
 OUT="$REPO/apps/ios/OuraCore.xcframework"

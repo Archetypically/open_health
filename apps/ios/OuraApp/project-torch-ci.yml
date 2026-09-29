@@ -1,0 +1,149 @@
+# xcodegen spec for the WITH-TORCH CI build of OuraApp — the one the Xcode Cloud
+# workflow archives when OURA_CI_TORCH=1. It is project.yml minus the personal
+# oura.db bundle: a clean cloud checkout has no local database (the app builds its
+# own from the ring over BLE), and xcodegen fails on a missing source path.
+#
+# The other two inputs are not in git either, so ci_scripts/ci_post_clone.sh
+# fetches both before running this spec:
+#   apps/ios/libtorch-xcframeworks/*.xcframework  from a release-asset tarball
+#   notes/models/mobile/*.ptl                     from a private store, bearer token
+# See apps/ios/XCODE_CLOUD.md.
+name: OuraApp
+options:
+  bundleIdPrefix: md.thomas
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+schemes:
+  OuraApp:
+    build:
+      targets:
+        OuraApp: all
+    test:
+      targets: [OuraAppTests]
+    run:
+      config: Debug
+    archive:
+      config: Release
+
+settings:
+  base:
+    MARKETING_VERSION: "0.1.1"
+    # ci_post_clone.sh exports CI_BUILD_NUMBER; xcodegen expands ${VAR} in the spec.
+    # Never hardcode this — TestFlight rejects a build number it has already seen.
+    CURRENT_PROJECT_VERSION: "${CI_BUILD_NUMBER}"
+    PRODUCT_BUNDLE_IDENTIFIER: md.thomas.openoura
+    TARGETED_DEVICE_FAMILY: "1"   # iPhone only (no iPad multitasking orientation reqs)
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_ENTITLEMENTS: OuraApp.entitlements
+    DEVELOPMENT_TEAM: "BQ6Z84B8L5"
+    # Xcode's current project recommendations. There are no target shell-script
+    # phases, so sandboxing is safe; generated symbols are opt-in conveniences
+    # and do not change the existing asset/string lookup APIs.
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    LOCALIZATION_PREFERS_STRING_CATALOGS: YES
+    STRING_CATALOG_GENERATE_SYMBOLS: YES
+    ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS: YES
+
+targets:
+  OuraApp:
+    type: application
+    platform: iOS
+    settings:
+      base:
+        INFOPLIST_FILE: Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        SWIFT_EMIT_LOC_STRINGS: YES
+        STRING_CATALOG_GENERATE_SYMBOLS: YES
+        TARGETED_DEVICE_FAMILY: "1"   # iPhone-only (target-level, overrides xcodegen's 1,2 default)
+        # on-device torch: bridging header + TORCH flag + C++ + libtorch headers
+        SWIFT_OBJC_BRIDGING_HEADER: TorchBridge.h
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: TORCH
+        CLANG_CXX_LANGUAGE_STANDARD: "c++17"
+        # SYSTEM (not user) header search paths: libtorch headers are third-party
+        # and trip -Wdocumentation / -Wshorten-64-to-32 warnings we can't fix —
+        # system headers are exempt from warnings, keeping the build log clean.
+        # The xcframeworks carry binaries + dSYMs only, so ci_post_clone.sh vendors
+        # the header tree alongside them; the local project.yml instead points at
+        # the libtorch build dir that package-libtorch-xcframeworks.sh ran in.
+        SYSTEM_HEADER_SEARCH_PATHS:
+          - $(SRCROOT)/../libtorch-xcframeworks/include
+          - $(SRCROOT)/../libtorch-xcframeworks/include/torch/csrc/api/include
+        # no -lc++ here: TorchBridge.mm makes this a C++ target, so Xcode already
+        # links libc++ — passing it again makes ld warn about a duplicate library.
+        OTHER_LDFLAGS: [-lsqlite3]
+        LD_RUNPATH_SEARCH_PATHS: [$(inherited), "@executable_path/Frameworks"]
+    sources:
+      - path: OuraApp.swift
+      - path: Models.swift
+      - path: Core.swift
+      - path: WorkCoordinator.swift
+      - path: Components.swift
+      - path: Reports.swift
+      - path: DayExport.swift
+      - path: RawData.swift
+      - path: HeartRate.swift
+      - path: Theme.swift
+      - path: BLETransport.swift
+      - path: RingSync.swift
+      - path: ProfileSettings.swift
+      - path: EventStore.swift
+      - path: ModelCache.swift
+      - path: ModelProgress.swift
+      - path: SleepStaging.swift
+      - path: CvaModel.swift
+      - path: ActivityModel.swift
+      - path: IllnessModel.swift
+      - path: TorchBridge.mm
+      - path: TorchBridge.h
+      - path: CrashCatch.c
+      - path: CrashCatch.h
+      - path: Diagnostics.swift
+      - path: HealthExport.swift
+      - path: ../generated/oura_core.swift
+      - path: Assets.xcassets
+      # the on-device models, fetched by ci_post_clone.sh. Decrypted Oura weights:
+      # never in git, never a release asset, never LFS.
+      - path: ../../../notes/models/mobile/sleepnet_moonstone_1_2_0.ptl
+        buildPhase: resources
+      - path: ../../../notes/models/mobile/cva_2_1_0.ptl
+        buildPhase: resources
+      - path: ../../../notes/models/mobile/automatic_activity_detection_3_1_11.ptl
+        buildPhase: resources
+      - path: ../../../notes/models/mobile/steps_motion_decoder_2_0_0.ptl
+        buildPhase: resources
+      - path: ../../../notes/models/mobile/illness_detection_0_5_1.ptl
+        buildPhase: resources
+    dependencies:
+      - sdk: HealthKit.framework
+      # Rust core (static lib in an xcframework) — link, don't embed
+      - framework: ../OuraCore.xcframework
+        embed: false
+      # libtorch lite interpreter — xcframeworks (device + sim slices) so an archive
+      # picks the right one per SDK. Link AND embed+sign into Frameworks.
+      # Built by: spike/build_libtorch_ios.sh [device] + package-libtorch-xcframeworks.sh
+      - framework: ../libtorch-xcframeworks/libtorch.xcframework
+        embed: true
+        codeSign: true
+      - framework: ../libtorch-xcframeworks/libtorch_cpu.xcframework
+        embed: true
+        codeSign: true
+      - framework: ../libtorch-xcframeworks/libc10.xcframework
+        embed: true
+        codeSign: true
+      - framework: ../libtorch-xcframeworks/libtorch_global_deps.xcframework
+        embed: true
+        codeSign: true
+
+  OuraAppTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: OuraApp
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: TORCH

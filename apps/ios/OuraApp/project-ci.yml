@@ -3,7 +3,8 @@
 # checkout doesn't have), so it builds from just the repo + the Rust xcframework that
 # ci_scripts/ci_post_clone.sh rebuilds. The app shows the model-free summary and can
 # sync from a real ring over BLE; the on-device hypnogram/CVA/activity models are only
-# in the local torch build (project.yml). Generate with:
+# in the local torch build (project.yml) and its CI twin (project-torch-ci.yml,
+# selected by OURA_CI_TORCH=1 in ci_scripts/ci_post_clone.sh). Generate with:
 #   xcodegen generate --spec project-ci.yml
 name: OuraApp
 options:
@@ -15,7 +16,9 @@ options:
 settings:
   base:
     MARKETING_VERSION: "0.1.1"
-    CURRENT_PROJECT_VERSION: "27"
+    # ci_post_clone.sh exports CI_BUILD_NUMBER; xcodegen expands ${VAR} in the spec.
+    # Never hardcode this — TestFlight rejects a build number it has already seen.
+    CURRENT_PROJECT_VERSION: "${CI_BUILD_NUMBER}"
     PRODUCT_BUNDLE_IDENTIFIER: md.thomas.openoura
     TARGETED_DEVICE_FAMILY: "1"   # iPhone only (no iPad multitasking orientation reqs)
     CODE_SIGN_STYLE: Automatic
