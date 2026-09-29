@@ -3,8 +3,8 @@
 A clean Xcode Cloud checkout has **none** of the gitignored build inputs
 (`OuraCore.xcframework`, `OuraApp.xcodeproj`, libtorch, the `.ptl` models, `oura.db`).
 So CI rebuilds what it can and generates the Xcode project from a spec:
-`ci_scripts/ci_post_clone.sh` builds the Rust xcframework, then runs
-`xcodegen generate` in `apps/ios/OuraApp/`.
+`apps/ios/OuraApp/ci_scripts/ci_post_clone.sh` builds the Rust xcframework, then
+runs `xcodegen generate` in `apps/ios/OuraApp/`.
 
 | build | `OURA_CI_TORCH` | spec | ships |
 |---|---|---|---|
@@ -41,9 +41,14 @@ Then **Product → Xcode Cloud → Create Workflow…** and fill in:
 | Actions | **Archive** → scheme `OuraApp`, platform iOS → *TestFlight (Internal Testing Only)* |
 | Post-actions | **TestFlight** → Internal, and add yourself as a tester |
 
-`ci_scripts/ci_post_clone.sh` runs automatically before the actions; it is committed
-mode `755`, which Xcode Cloud requires. After the first successful build you can edit
-and create workflows in **App Store Connect → your app → Xcode Cloud** instead.
+`apps/ios/OuraApp/ci_scripts/ci_post_clone.sh` runs automatically before the
+actions, with no wiring needed. It must sit **next to the `.xcodeproj`**, not at the
+repository root — Apple requires the `ci_scripts` directory to be "in the same
+directory as your Xcode project or workspace", and Xcode Cloud silently skips the
+build's own setup (logging only `Post-Clone script not found`) when it is elsewhere.
+It is committed mode `755`, which Xcode Cloud also requires. After the first
+successful build you can edit and create workflows in
+**App Store Connect → your app → Xcode Cloud** instead.
 
 That is it — each push to `evan/customizations` produces a TestFlight build.
 
