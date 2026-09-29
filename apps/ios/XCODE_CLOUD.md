@@ -1,31 +1,140 @@
-# Xcode Cloud → auto TestFlight on merge (model-free)
+# Xcode Cloud → auto TestFlight on merge
 
 A clean Xcode Cloud checkout has **none** of the gitignored build inputs
 (`OuraCore.xcframework`, `OuraApp.xcodeproj`, libtorch, the `.ptl` models, `oura.db`).
-So CI builds the **model-free** target: it rebuilds the Rust xcframework and generates
-the project from `project-ci.yml` in `ci_scripts/ci_post_clone.sh`. The app ships the
-model-free summary and **syncs from a real ring over BLE**; the on-device
-hypnogram / CVA / activity models are not in CI (they need libtorch + `.ptl`).
+So CI rebuilds what it can and generates the Xcode project from a spec:
+`ci_scripts/ci_post_clone.sh` builds the Rust xcframework, then runs
+`xcodegen generate` in `apps/ios/OuraApp/`.
 
-## One-time setup (your Apple account)
+| build | `OURA_CI_TORCH` | spec | ships |
+|---|---|---|---|
+| model-free (default) | unset | `project-ci.yml` | repo + Rust core; syncs a real ring over BLE |
+| with the on-device models | `1` | `project-torch-ci.yml` | + libtorch runtime + the `.ptl` models |
 
-1. In **App Store Connect → your app → Xcode Cloud** (or Xcode → Product → Xcode Cloud),
-   create a workflow.
-2. Source: this repo, **start condition = push to `main`** (or the PR branch).
-3. Environment: latest Xcode. Xcode Cloud auto-runs `ci_scripts/ci_post_clone.sh`.
-4. Action: **Archive** the `OuraApp` scheme → **Post-action: TestFlight (Internal)**.
-5. Signing is automatic (Xcode Cloud manages it); the bundle id is `md.thomas.openoura`.
+## One-time setup
 
-That's it — each merge to `main` produces a TestFlight build.
+**1. An app record.** App Store Connect → **Apps** → **+** → **New App**, with the
+bundle id `md.thomas.openoura`. Creating it needs the App Manager, Admin or Account
+Holder role (or the *Create Apps* permission).
 
-## Adding the on-device models to CI later
+**2. Authorize the repository.** App Store Connect → your app → **Xcode Cloud** tab,
+add the GitHub source. GitHub then asks to install the *Xcode Cloud* GitHub App on
+`Th0rgal/open_health`. **Only the owner of that GitHub account can approve it** —
+GitHub requires admin on the owning account, and `Th0rgal` is a personal account,
+not an org you administer. A contributor cannot connect the repo alone; if that
+authorization is not available, the pipeline has to live in a repo you own instead.
 
-The torch models are deliberately out of CI because:
-- **libtorch** (~80 MB of dylibs) is too slow to build per run → must be **vendored**
-  (build once with `spike/build_libtorch_ios.sh device` + `package-libtorch-xcframeworks.sh`,
-  then commit via **Git LFS** or fetch a release asset in `ci_post_clone.sh`).
-- the **`.ptl` models are decrypted/sensitive** and must NOT go in git — host them in a
-  private store and fetch with a pre-signed URL kept in an Xcode Cloud **secret** env var.
+**3. Create the first workflow in Xcode, not in App Store Connect.** Apple requires
+the initial setup in Xcode, and it needs a project window — so generate one first,
+the same way a CI run will:
 
-Once both are fetched in `ci_post_clone.sh`, point the workflow at `project.yml` (the
-full torch spec) instead of `project-ci.yml`.
+```bash
+cd apps/ios/OuraApp && xcodegen generate --spec project-ci.yml && open OuraApp.xcodeproj
+```
+
+Then **Product → Xcode Cloud → Create Workflow…** and fill in:
+
+| section | setting |
+|---|---|
+| General | name it; tick **Restrict editing** (required for review-eligible builds) |
+| Environment | macOS + Xcode versions; add the env vars from the torch section below, ticking **Keep value redacted** for the token |
+| Start Conditions | **Branch Changes** on `main` (leave *Auto-cancel Builds* on) |
+| Actions | **Archive** → scheme `OuraApp`, platform iOS → *TestFlight (Internal Testing Only)* |
+| Post-actions | **TestFlight** → Internal, and add yourself as a tester |
+
+`ci_scripts/ci_post_clone.sh` runs automatically before the actions; it is committed
+mode `755`, which Xcode Cloud requires. After the first successful build you can edit
+and create workflows in **App Store Connect → your app → Xcode Cloud** instead.
+
+That is it — each merge to `main` produces a TestFlight build.
+
+## Build numbers
+
+Never hardcode `CURRENT_PROJECT_VERSION` in a CI spec: TestFlight rejects a build
+number it has already seen, so a literal means the second run fails to upload.
+`ci_post_clone.sh` stamps `CI_BUILD_NUMBER` from the UTC clock and exports it;
+xcodegen expands `${CI_BUILD_NUMBER}` in the spec. The commit count is not a usable
+source — Xcode Cloud clones shallow, so `rev-list --count` returns 1. The local
+`project.yml` keeps its literal because that path is a manual upload, not CI.
+
+## The model-free build (default)
+
+Nothing to configure. CI compiles the Rust core, links both the `ios-arm64` and
+`ios-arm64-simulator` slices of `OuraCore.xcframework`, and archives. The on-device
+hypnogram / CVA / activity / illness models are compiled out (`#if TORCH`).
+
+## The torch build (opt-in)
+
+Set these in the workflow's environment:
+
+| variable | value |
+|---|---|
+| `OURA_CI_TORCH` | `1` |
+| `LIBTORCH_XCFRAMEWORKS_URL` | release-asset URL of `libtorch-xcframeworks.tar.gz` |
+| `MODELS_BASE_URL` | private prefix holding the five `.ptl` files |
+| `MODELS_TOKEN` | bearer token for that store |
+
+The script fails fast naming the missing variable, rather than generating a project
+that cannot compile.
+
+`project-torch-ci.yml` is `project.yml` **minus the `oura.db` resource**: a cloud
+checkout has no personal database (the app builds its own from the ring over BLE),
+and xcodegen errors on a missing source path. Its header search paths point at the
+vendored `include/` tree instead of the local libtorch build dir, since an
+xcframework carries binaries and dSYMs but no headers.
+
+### 1. Build libtorch once, publish it — never in CI
+
+The CMake build takes hours, so it happens locally, once:
+
+```bash
+cd apps/ios
+./spike/build_libtorch_ios.sh          # simulator → local/libtorch-ios/pytorch/build_ios
+./spike/build_libtorch_ios.sh device   # device    → …/build_ios_device
+./package-libtorch-xcframeworks.sh     # → apps/ios/libtorch-xcframeworks/ (+ include/, + the tar command)
+```
+
+Attach the resulting `libtorch-xcframeworks.tar.gz` to a release on this repo and
+put its URL in `LIBTORCH_XCFRAMEWORKS_URL`. PyTorch is BSD, so a public asset leaks
+nothing — this repo is public, and a release asset on it is world-readable.
+
+### 2. Host the `.ptl` models privately
+
+The models are decrypted Oura weights, so they must never enter git — not a
+commit, not Git LFS, and not a release asset on a public repo. Put all five under
+one private prefix (`sleepnet_moonstone_1_2_0.ptl`, `cva_2_1_0.ptl`,
+`automatic_activity_detection_3_1_11.ptl`, `steps_motion_decoder_2_0_0.ptl`,
+`illness_detection_0_5_1.ptl`) and give CI a bearer token. The specs hardcode those
+names under `notes/models/mobile/`, so CI must write them there verbatim.
+
+### 3. Why a release asset and not LFS
+
+LFS would work, but it adds a git-lfs dependency, spends the repository's LFS
+bandwidth on every CI run, and leaves the binaries in history forever. A tarball
+fetched by `ci_post_clone.sh` is one HTTP request from a CDN-backed asset and
+nothing to install.
+
+## Verified locally
+
+Both CI paths were exercised on a workstation, not just reasoned about:
+
+- `build-xcframework.sh` produces `OuraCore.xcframework` with an `ios-arm64` slice
+  whose objects carry `LC_VERSION_MIN_IPHONEOS`, and an `ios-arm64-simulator` slice
+  with `LC_BUILD_VERSION platform 7` — real iOS binaries, not a macOS fallback.
+- `ci_post_clone.sh` (model-free) runs clean: Rust core, bindings, xcframework,
+  then `xcodegen generate`.
+- The generated model-free project builds for device in Release against the
+  `ios-arm64` slice.
+- `project-torch-ci.yml` generates with placeholder artifacts, wiring all four
+  libtorch xcframeworks, the vendored `include/` path, and no `oura.db`.
+
+The torch *compile* is the one thing not verified here: it needs the real libtorch
+build and the real `.ptl` files, neither of which is on this machine.
+
+## Local developer directory
+
+If `xcode-select` points at Command Line Tools, `xcrun` cannot find the iPhoneOS
+SDK and the iOS link fails with a confusing macOS-sysroot error.
+`build-xcframework.sh` detects this and exports `DEVELOPER_DIR` to the installed
+Xcode for the length of the script; run `sudo xcode-select -s
+/Applications/Xcode.app/Contents/Developer` once to fix the shell for good.
