@@ -24,11 +24,15 @@ echo "    project dir: $APPDIR"
 echo "    repo root:   $REPO"
 [ -f "$APPDIR/project-ci.yml" ] || die "no project spec at $APPDIR/project-ci.yml — wrong location?"
 
-# Xcode Cloud clones shallow, so the commit count is not a usable version source
-# (a depth-1 clone counts 1). TestFlight only requires a build number it has never
-# seen, and runs of one workflow never share a minute, so stamp it from the clock.
-# xcodegen expands ${CI_BUILD_NUMBER} in the specs.
-CI_BUILD_NUMBER="${CI_BUILD_NUMBER:-$(date -u +%Y%m%d%H%M)}"
+# Xcode Cloud sets CI_BUILD_NUMBER to a per-workflow run counter — it was 3 on the
+# first successful archive — and that counter restarts at 1 for every new workflow.
+# TestFlight rejects a build number it has already seen for a given marketing
+# version, so a second workflow (say, the torch one) would collide with the first
+# workflow's builds. Stamp from the UTC clock and deliberately overwrite the
+# inherited value; xcodegen expands ${CI_BUILD_NUMBER} in the specs. The commit
+# count is not a usable source either: Xcode Cloud clones shallow, so
+# rev-list --count returns 1.
+CI_BUILD_NUMBER="$(date -u +%Y%m%d%H%M)"
 export CI_BUILD_NUMBER
 
 # xcodegen, to generate the project from the CI spec. Idempotent: newer Xcode
