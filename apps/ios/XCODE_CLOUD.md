@@ -37,7 +37,7 @@ Then **Product → Xcode Cloud → Create Workflow…** and fill in:
 |---|---|
 | General | name it; tick **Restrict editing** (required for review-eligible builds) |
 | Environment | macOS + Xcode versions; add the env vars from the torch section below, ticking **Keep value redacted** for the token |
-| Start Conditions | **Branch Changes** on `customizations` (leave *Auto-cancel Builds* on) |
+| Start Conditions | **Branch Changes** on `evan/customizations` (leave *Auto-cancel Builds* on) |
 | Actions | **Archive** → scheme `OuraApp`, platform iOS → *TestFlight (Internal Testing Only)* |
 | Post-actions | **TestFlight** → Internal, and add yourself as a tester |
 
@@ -45,7 +45,7 @@ Then **Product → Xcode Cloud → Create Workflow…** and fill in:
 mode `755`, which Xcode Cloud requires. After the first successful build you can edit
 and create workflows in **App Store Connect → your app → Xcode Cloud** instead.
 
-That is it — each push to `customizations` produces a TestFlight build.
+That is it — each push to `evan/customizations` produces a TestFlight build.
 
 ## Repository layout
 
@@ -56,20 +56,20 @@ what makes the **Sync fork** button work. Your work is not on `main`:
 | branch | contents |
 |---|---|
 | `main` | upstream's history only; auto-synced, never committed to by hand |
-| `customizations` | your commits, currently one ahead of `main` |
+| `evan/customizations` | your commits, two ahead of `main` |
 
-That is why the start condition above is a push to `customizations`. When upstream
-moves, bring it forward from that branch:
+That is why the start condition above is a push to `evan/customizations`. When
+upstream moves, bring it forward from that branch:
 
 ```bash
 git fetch upstream
-git rebase upstream/main                    # on customizations
-git push --force-with-lease origin customizations
+git rebase upstream/main                    # on evan/customizations
+git push --force-with-lease origin evan/customizations
 ```
 
 Rebasing keeps your commits linear instead of accumulating merge commits. The
 trade-off: an auto-synced `main` never goes through CI, so upstream commits land
-unbuilt — only your pushes to `customizations` are verified by a build.
+unbuilt — only your pushes to `evan/customizations` are verified by a build.
 
 ## Build numbers
 
