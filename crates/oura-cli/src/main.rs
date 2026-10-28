@@ -8,7 +8,10 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 
 use oura_link::ble::{self, BleTransport};
+use oura_link::client::DEFAULT_QUIET;
+use oura_link::transport::transact_until;
 use oura_link::OuraClient;
+use oura_protocol::protocol::{self, Packet};
 use oura_store::storage::Store;
 
 #[cfg(feature = "torch")]
@@ -933,6 +936,56 @@ async fn cmd_info(cli: &Cli, key: &Option<[u8; 16]>) -> Result<()> {
     Ok(())
 }
 
+// oura-link's sync_time*/feature_status use its untargeted `request`, which always sits
+// out the whole quiet window after the reply. The helpers below send the same bytes
+// but stop on the known reply (a command answers with its tag + 1; a feature status
+// with ext 0x21), keeping the quiet window as the fallback for a ring that never does.
+const TIME_SYNC_REPLY: u8 = 0x13;
+
+async fn request_until(
+    client: &OuraClient<BleTransport>,
+    request: &[u8],
+    done: impl Fn(&Packet) -> bool,
+) -> oura_link::Result<Vec<Packet>> {
+    let frames = transact_until(client.transport(), request, DEFAULT_QUIET, |frame| {
+        Packet::parse_many(frame).iter().any(&done)
+    })
+    .await?;
+    Ok(frames.iter().flat_map(|f| Packet::parse_many(f)).collect())
+}
+
+async fn sync_time_app_fast(client: &OuraClient<BleTransport>) -> oura_link::Result<()> {
+    let now = unix_now();
+    let token = (now as u8).wrapping_mul(37).wrapping_add(0xa5);
+    let req = protocol::req_sync_time_counter(now, token);
+    request_until(client, &req, |p| p.tag == TIME_SYNC_REPLY)
+        .await
+        .map(|_| ())
+}
+
+async fn sync_time_fast(client: &OuraClient<BleTransport>) -> oura_link::Result<()> {
+    let req = protocol::req_sync_time(unix_now(), 0);
+    request_until(client, &req, |p| p.tag == TIME_SYNC_REPLY)
+        .await
+        .map(|_| ())
+}
+
+/// `OuraClient::feature_status(id).mode`, stopping on the status packet.
+async fn feature_mode(client: &OuraClient<BleTransport>, id: u8) -> Option<u8> {
+    let is_status = |p: &Packet| p.ext_tag() == Some(0x21) && p.payload.len() >= 6;
+    let packets = request_until(client, &protocol::req_feature_status(id), is_status)
+        .await
+        .ok()?;
+    packets.iter().find(|p| is_status(p)).map(|p| p.payload[2])
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn is_rejected_history_cursor(error: &str) -> bool {
     error.contains("extended history request failed with result code 0xff")
 }
@@ -1014,18 +1067,18 @@ async fn cmd_sync(cli: &Cli, key: &Option<[u8; 16]>, sync_time: bool) -> Result<
         // Same order as the iOS app: the official-app counter form, then the older
         // unix+timezone form. The anchor event this writes is what dates the history;
         // a failure is worth a warning, not a failed sync.
-        if let Err(e) = client.sync_time_app().await {
+        if let Err(e) = sync_time_app_fast(&client).await {
             tracing::debug!("app-style time sync failed ({e}); trying the legacy form");
-            if let Err(e) = client.sync_time().await {
+            if let Err(e) = sync_time_fast(&client).await {
                 eprintln!(
                     "warning: could not align the ring clock ({e}); recent nights may stay undated"
                 );
             }
         }
     }
-    // Like the iOS app: ask the ring to postprocess its sleep before the drain, so a
-    // finished night's bedtime_period lands in this sync instead of the next one.
-    let _ = client.check_sleep_analysis(false).await;
+    // No separate check_sleep_analysis(false): it is the same `28 01 00` DataFlush
+    // drain_events sends before every batch, which already asks the ring to
+    // postprocess a finished sleep. Sending it here only sat out a quiet window.
 
     let serial = client.serial().await.unwrap_or_else(|_| "unknown".into());
     let info = client.firmware().await.ok();
@@ -1082,8 +1135,8 @@ async fn cmd_sync(cli: &Cli, key: &Option<[u8; 16]>, sync_time: bool) -> Result<
         ];
         let mut modes = serde_json::Map::new();
         for (id, name) in feats {
-            if let Ok(s) = client.feature_status(id).await {
-                modes.insert(name.to_string(), serde_json::json!(s.mode));
+            if let Some(mode) = feature_mode(&client, id).await {
+                modes.insert(name.to_string(), serde_json::json!(mode));
             }
         }
         if !modes.is_empty() {
