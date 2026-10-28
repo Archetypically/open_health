@@ -70,6 +70,10 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
         return _connectedPeripheralID
     }
     private var writeChar: CBCharacteristic?
+    // The remembered ring, asked for by identifier while the scan runs (see
+    // `startDirectConnect`). Not `peripheral` until it actually connects, so the
+    // timeout still reports "not advertising" when neither path found the ring.
+    private var directCandidate: CBPeripheral?
     private let nameContains: String
     private let preferredPeripheralID: UUID?
     private let excludedPeripheralIDs: Set<UUID>
@@ -188,6 +192,52 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
         central.scanForPeripherals(
             withServices: nil,
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+        startDirectConnect()
+    }
+
+    /// Reconnect to the ring this phone last synced without waiting for the scan to
+    /// report it: iOS holds a pending connection to a known identifier and opens it
+    /// on the ring's first advertisement, which skips the discovery report (and its
+    /// scan-response wait) and keeps working when the ring advertises sparsely. The
+    /// scan keeps running beside it, so a ring with a new identifier, or a factory
+    /// reset, is still found the old way.
+    private func startDirectConnect() {
+        guard let id = preferredPeripheralID, !excludedPeripheralIDs.contains(id),
+              directCandidate == nil, peripheral == nil else { return }
+        // A ring iOS already has a link to (the official app on this phone, say) does
+        // not advertise; joining that link would interleave our auth and drain with
+        // the other app's traffic. Leave it alone and let the scan report as before.
+        if central.retrieveConnectedPeripherals(withServices: [RingUUID.service])
+            .contains(where: { $0.identifier == id }) {
+            dlog("ble", "remembered ring id=\(id.uuidString.suffix(12)) is already connected to iOS; not joining that link")
+            return
+        }
+        guard let p = central.retrievePeripherals(withIdentifiers: [id]).first else { return }
+        dlog("ble", "pending direct connect to remembered ring id=\(id.uuidString.suffix(12)) alongside the scan")
+        directCandidate = p
+        central.connect(p, options: nil)
+    }
+
+    /// Drop the pending direct connect unless it became the live link.
+    private func cancelDirectCandidate() {
+        guard let candidate = directCandidate else { return }
+        directCandidate = nil
+        if candidate.identifier != peripheral?.identifier { central.cancelPeripheralConnection(candidate) }
+    }
+
+    /// Commit to `peripheral` as this attempt's ring. `connecting` is false when the
+    /// GATT link is already up (the direct connect won) and true when it still has
+    /// to be opened (the scan found the ring).
+    private func adopt(_ peripheral: CBPeripheral, connecting: Bool) {
+        central.stopScan()
+        lock.lock()
+        stage = connecting ? "GATT-connecting to the discovered ring" : "discovering services/characteristics"
+        _connectedPeripheralID = peripheral.identifier
+        lock.unlock()
+        self.peripheral = peripheral
+        peripheral.delegate = self
+        if directCandidate?.identifier == peripheral.identifier { directCandidate = nil } else { cancelDirectCandidate() }
+        if connecting { central.connect(peripheral, options: nil) }
     }
 
     /// Finish the inbound frame stream so a Rust drain blocked on `recv` returns at once
@@ -199,6 +249,7 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
         guard !closed else { return }
         closed = true
         central.stopScan()
+        cancelDirectCandidate()
         finishWrite(.failure(BLEError.disconnected))
         finishConnect(.failure(BLEError.disconnected))
         notifyContinuation?.finish()
@@ -315,19 +366,21 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
             return
         }
         guard self.peripheral == nil else { return }
-        central.stopScan()
         dlog("ble", "ring matched id=\(peripheral.identifier.uuidString.suffix(12)) rssi=\(RSSI) otherDevices=\(otherDevices.count); connecting")
-        lock.lock()
-        stage = "GATT-connecting to the discovered ring"
-        _connectedPeripheralID = peripheral.identifier
-        lock.unlock()
-        self.peripheral = peripheral
-        peripheral.delegate = self
-        central.connect(peripheral, options: nil)
+        // When this is the remembered ring, a direct connect is already pending for
+        // it; connecting again just keeps that request.
+        adopt(peripheral, connecting: true)
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        guard !closed, self.peripheral === peripheral else { return }
+        guard !closed else { return }
+        if self.peripheral == nil, peripheral.identifier == directCandidate?.identifier {
+            lock.lock(); let active = connectCont != nil; lock.unlock()
+            guard active else { return cancelDirectCandidate() }
+            dlog("ble", "direct connect to the remembered ring won the scan")
+            adopt(peripheral, connecting: false)
+        }
+        guard self.peripheral === peripheral else { return }
         let mtu = peripheral.maximumWriteValueLength(for: .withResponse)
         dlog("ble", "GATT connected (maxWrite=\(mtu)B); discovering the Oura service")
         lock.lock(); stage = "discovering services/characteristics"; lock.unlock()
@@ -336,6 +389,12 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral,
                         error: Error?) {
+        if !closed, self.peripheral == nil, peripheral.identifier == directCandidate?.identifier {
+            // Only the shortcut failed; the scan is still looking.
+            dlog("ble", "direct connect failed (\(error.map { String(describing: $0) } ?? "no error info")); relying on the scan")
+            directCandidate = nil
+            return
+        }
         guard !closed, self.peripheral === peripheral else { return }
         dlog("ble", "GATT connect FAILED: \(error.map { String(describing: $0) } ?? "no error info")")
         finishConnect(.failure(error ?? BLEError.notFound))
@@ -512,6 +571,7 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
             // delivering its callbacks, and reset the per-attempt state so a stray late
             // didUpdateNotificationStateFor can't bleed into a later connect's counter.
             if let p = peripheral { central.cancelPeripheralConnection(p) }
+            cancelDirectCandidate()
             peripheral = nil
             writeChar = nil
             lock.lock(); pendingNotify = 0; lock.unlock()

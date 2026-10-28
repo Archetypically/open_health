@@ -240,6 +240,11 @@ impl Store {
             .query_row("PRAGMA quick_check", [], |r| r.get(0))?)
     }
 
+    #[cfg(test)]
+    pub(crate) fn conn_for_tests(&self) -> &Connection {
+        &self.conn
+    }
+
     /// Open an in-memory database (useful for tests).
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;

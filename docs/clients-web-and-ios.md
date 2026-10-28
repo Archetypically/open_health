@@ -120,7 +120,9 @@ a nap doesn't shadow the real sleep.
   are coalesced into 32 KB chunks before crossing UniFFI; control/summary frames stay
   immediate, and diagnostics log only the aggregate frame/byte count rather than raw
   sensor payloads. This mirrors Android's `ExtGetEvent` raw-buffer accumulation without
-  sacrificing the Rust client's 4,096-event cursor checkpoints.
+  sacrificing the Rust client's 4,096-event cursor checkpoints. Both clients commit each
+  batch (with its cursor, in order) on `oura-store`'s `BatchCommitter` thread while the
+  next batch transfers, so SQLite no longer idles the link between batches.
 
 ## Sleep metrics: two code paths, one algorithm — keep them in sync
 
@@ -198,6 +200,9 @@ has no `illness`) and the ring-clock warnings (`clock.warnings`). Still iOS-only
   systems, ring RMSSD remains visible in the app rather than being mislabeled as
   SDNN. Reconciliation removes only this exporter's legacy `openoura.hrv.*` SDNN
   records, using existing authorization; it requests no new SDNN access.
+- **Direct reconnect to the remembered ring**: `BLETransport` asks iOS for the last
+  synced ring by identifier alongside its scan, so a reconnect does not wait for a
+  discovery report. Desktop `oura sync` (btleplug in `oura-link`) still scans every time.
 - **Sleep score + breathing rate** (`nights[].sleep_score`, `breath_rate`).
 - **Skin temperature / latest HR vitals and trend pages**, **hourly heart rate**
   (`hourly_hr` is FFI-only; no `/api` endpoint yet).

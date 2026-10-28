@@ -8,7 +8,7 @@ revision or relying on a sibling directory.
 
 Changes: system SQLite on iOS, read-only opening, mandatory WAL configuration,
 full durability, transactional batch/checkpoint commits, a cached event-insert
-statement, extended SQLite errors,
+statement, an in-order background batch committer (`pipeline.rs`), extended SQLite errors,
 streaming-query indexes (including the partial `idx_events_decoded_tag` behind the
 iOS store digest), integrity checks, and regression tests.
 

@@ -12,6 +12,7 @@ use oura_link::client::DEFAULT_QUIET;
 use oura_link::transport::transact_until;
 use oura_link::OuraClient;
 use oura_protocol::protocol::{self, Packet};
+use oura_store::pipeline::BatchCommitter;
 use oura_store::storage::Store;
 
 #[cfg(feature = "torch")]
@@ -990,19 +991,18 @@ fn is_rejected_history_cursor(error: &str) -> bool {
     error.contains("extended history request failed with result code 0xff")
 }
 
+/// Drain from `cursor` into `store`, committing each batch with its cursor on
+/// oura-store's committer thread while the next batch transfers, so storage no
+/// longer leaves the BLE link idle (same as the iOS sync). The store comes back
+/// whatever happened, for the rebase and anchor writes that follow.
 async fn drain_events_into_store(
     client: &OuraClient<BleTransport>,
-    store: &Store,
+    store: Store,
     serial: &str,
     cursor: u32,
     inserted: &std::cell::Cell<u32>,
-) -> Result<(u32, u32)> {
-    let db_err = std::cell::RefCell::new(None);
-    let cursor_advanced = std::cell::Cell::new(false);
-    // Events are buffered per batch and committed with the cursor in ONE
-    // transaction. Row-by-row autocommit under WAL + synchronous=FULL costs an
-    // fsync per event, which made 255-event legacy (Gen 3) batches crawl on slow
-    // storage (same as open_oura's CLI).
+) -> (Store, Result<(u32, u32)>) {
+    let committer = BatchCommitter::spawn(store, serial, cursor);
     let pending = std::cell::RefCell::new(Vec::new());
     let batch_started = std::cell::Cell::new(std::time::Instant::now());
     let outcome = client
@@ -1014,41 +1014,36 @@ async fn drain_events_into_store(
             },
             |p| {
                 let link = batch_started.get().elapsed();
-                let db_started = std::time::Instant::now();
-                let events = std::mem::take(&mut *pending.borrow_mut());
-                match store.commit_batch(serial, &events, p.next_cursor) {
-                    Ok(n) => {
-                        inserted.set(inserted.get() + n);
-                        cursor_advanced.set(true);
-                    }
-                    Err(e) => {
-                        *db_err.borrow_mut() = Some(e);
-                        return false;
-                    }
-                }
-                // Per-batch split: tells a slow BLE link apart from slow storage.
-                println!(
-                    "  … {} events so far, ~{:.1} KB left on ring ({} in batch: link {:.1}s, db {:.2}s)",
-                    p.events_synced,
-                    p.bytes_left as f64 / 1024.0,
-                    events.len(),
-                    link.as_secs_f64(),
-                    db_started.elapsed().as_secs_f64(),
-                );
                 batch_started.set(std::time::Instant::now());
-                true
+                let events = std::mem::take(&mut *pending.borrow_mut());
+                let (count, synced, kb_left) =
+                    (events.len(), p.events_synced, p.bytes_left as f64 / 1024.0);
+                committer.submit(events, p.next_cursor, move |c| {
+                    // Per-batch split: tells a slow BLE link apart from slow storage.
+                    println!(
+                        "  … {synced} events so far, ~{kb_left:.1} KB left on ring \
+                         ({count} in batch: link {:.1}s, db {:.2}s)",
+                        link.as_secs_f64(),
+                        c.elapsed.as_secs_f64(),
+                    );
+                })
             },
         )
-        .await?;
-    if let Some(e) = db_err.into_inner() {
-        let ctx = if cursor_advanced.get() {
+        .await;
+    let done = committer.finish();
+    inserted.set(inserted.get() + done.inserted);
+    if let Some(e) = done.error {
+        let ctx = if done.checkpoint != cursor {
             "storing event during sync (cursor advanced through earlier batches)"
         } else {
             "storing event during sync (cursor not advanced)"
         };
-        return Err(e).context(ctx);
+        return (done.store, Err(anyhow::Error::new(e).context(ctx)));
     }
-    Ok((outcome.events_synced, outcome.next_cursor))
+    let result = outcome
+        .map(|o| (o.events_synced, o.next_cursor))
+        .map_err(Into::into);
+    (done.store, result)
 }
 
 async fn cmd_sync(cli: &Cli, key: &Option<[u8; 16]>, sync_time: bool) -> Result<()> {
@@ -1090,16 +1085,18 @@ async fn cmd_sync(cli: &Cli, key: &Option<[u8; 16]>, sync_time: bool) -> Result<
     println!("Syncing events for {serial} from cursor {cursor} ...");
 
     let inserted = std::cell::Cell::new(0u32);
-    let first = drain_events_into_store(&client, &store, &serial, cursor, &inserted).await;
-    let (events_synced, next_cursor) = match first {
-        Ok(outcome) => outcome,
-        Err(error) if cursor > 0 && is_rejected_history_cursor(&error.to_string()) => {
+    let (store, first) = drain_events_into_store(&client, store, &serial, cursor, &inserted).await;
+    let (store, (events_synced, next_cursor)) = match first {
+        Ok(outcome) => (store, outcome),
+        Err(error) if cursor > 0 && is_rejected_history_cursor(&format!("{error:#}")) => {
             // Match the native/iOS recovery path. Ring 5 may reject a stale
             // cursor while retaining readable history. Checkpoint zero first so
             // an interrupted recovery resumes safely; inserts are deduplicated.
             store.set_cursor(&serial, 0)?;
             println!("  … ring rejected saved cursor {cursor}; replaying retained history");
-            drain_events_into_store(&client, &store, &serial, 0, &inserted).await?
+            let (store, replay) =
+                drain_events_into_store(&client, store, &serial, 0, &inserted).await;
+            (store, replay?)
         }
         Err(error) => return Err(error),
     };

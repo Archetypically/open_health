@@ -269,7 +269,6 @@ fn quick_summary(db_path: &str) -> Result<serde_json::Value, String> {
 // The iOS app does CoreBluetooth; this drives the SAME oura-link OuraClient<T>
 // (auth → app stream → drain → store) over a transport that bridges to Swift, so
 // the device builds its own DB from a real ring — no btleplug, no cloud.
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use oura_link::client::DEFAULT_QUIET;
@@ -277,6 +276,7 @@ use oura_link::transport::{transact_until, Transport};
 use oura_link::OuraClient;
 use oura_protocol::events::RingEvent;
 use oura_protocol::protocol::{self, Packet};
+use oura_store::pipeline::BatchCommitter;
 use oura_store::storage::Store;
 use tokio::sync::{broadcast, watch};
 
@@ -437,20 +437,27 @@ impl Transport for FfiTransport {
     }
 }
 
-/// Drain one incremental range, inserting each event before checkpointing its batch.
-/// Returning `false` from either callback makes oura-link withhold the ring ACK, so a
-/// database failure can never advance the cursor past data that was not persisted.
+/// What one incremental drain leaves behind.
+struct Drained {
+    outcome: oura_link::client::SyncOutcome,
+    inserted: u32,
+}
+
+/// Drain one incremental range into `store`. Each batch commits with its cursor on
+/// oura-store's committer thread while the drain already requests the next one, so
+/// SQLite no longer leaves the BLE link idle. A failed commit makes the next batch
+/// callback return `false`, which stops the drain, and the stored cursor never
+/// passes data that was not persisted. The store comes back either way, so the
+/// caller can rebase the cursor or write an anchor after a failure.
 async fn drain_into_store(
     client: &OuraClient<FfiTransport>,
     cursor: u32,
     serial: &str,
-    store: &Mutex<Store>,
-    inserted: &AtomicU32,
-    db_err: &Mutex<Option<SyncError>>,
-    progress: &dyn SyncProgressListener,
-) -> Result<oura_link::client::SyncOutcome, SyncError> {
+    store: Store,
+    progress: &Arc<dyn SyncProgressListener>,
+) -> (Store, Result<Drained, SyncError>) {
+    let committer = BatchCommitter::spawn(store, serial, cursor);
     let batch = Mutex::new(Vec::new());
-    let checkpoint = AtomicU32::new(cursor);
     let outcome = client
         .drain_events(
             cursor,
@@ -459,36 +466,30 @@ async fn drain_into_store(
                 true
             },
             |p| {
-                let mut events = batch.lock().unwrap();
-                match store
-                    .lock()
-                    .unwrap()
-                    .commit_batch(serial, &events, p.next_cursor)
-                {
-                    Ok(count) => {
-                        inserted.fetch_add(count, Ordering::Relaxed);
-                        checkpoint.store(p.next_cursor, Ordering::Relaxed);
-                        events.clear();
-                        progress.on_progress("sync".into(), p.bytes_left as u64, p.events_synced);
-                        true
-                    }
-                    Err(error) => {
-                        *db_err.lock().unwrap() = Some(storage_failure(
-                            "commit_batch",
-                            error,
-                            checkpoint.load(Ordering::Relaxed),
-                        ));
-                        false
-                    }
-                }
+                let events = std::mem::take(&mut *batch.lock().unwrap());
+                let progress = progress.clone();
+                let (bytes_left, events_synced) = (p.bytes_left as u64, p.events_synced);
+                // Blocks the drain only while an earlier batch is still queued, i.e.
+                // when SQLite is slower than the link.
+                committer.submit(events, p.next_cursor, move |_| {
+                    progress.on_progress("sync".into(), bytes_left, events_synced);
+                })
             },
         )
         .await;
+    let done = committer.finish();
     // A callback failure is a protocol wrapper; the database cause takes precedence.
-    if let Some(error) = db_err.lock().unwrap().take() {
-        return Err(error);
+    if let Some(error) = done.error {
+        let error = storage_failure("commit_batch", error, done.checkpoint);
+        return (done.store, Err(error));
     }
-    outcome.map_err(|e| SyncError::Failed(e.to_string()))
+    let result = outcome
+        .map(|outcome| Drained {
+            outcome,
+            inserted: done.inserted,
+        })
+        .map_err(|e| SyncError::Failed(e.to_string()));
+    (done.store, result)
 }
 
 /// An empty incremental fetch is normally legitimate. Verify it cheaply by asking
@@ -744,6 +745,8 @@ impl RingSession {
         progress: Box<dyn SyncProgressListener>,
     ) -> Result<SyncReport, SyncError> {
         let fail = |e: String| SyncError::Failed(e);
+        // Shared with the commit thread, which reports each batch once it is durable.
+        let progress: Arc<dyn SyncProgressListener> = Arc::from(progress);
         let key =
             parse_key(&key_hex).ok_or_else(|| fail("auth key must be 32 hex chars".into()))?;
         let transport = FfiTransport {
@@ -780,58 +783,39 @@ impl RingSession {
         let serial = client.serial().await.unwrap_or_else(|_| "unknown".into());
         let info = client.firmware().await.ok();
 
-        // Mutex<Store> keeps the future Send across the drain's awaits (rusqlite's
-        // Connection is !Sync), while still writing incrementally (no buffering).
-        let store = Mutex::new(Store::open(&db_path).map_err(|e| storage_failure("open", e, 0))?);
+        let store = Store::open(&db_path).map_err(|e| storage_failure("open", e, 0))?;
         store
-            .lock()
-            .unwrap()
             .upsert_device(&serial, None, info.as_ref())
             .map_err(|e| storage_failure("upsert_device", e, 0))?;
         let cursor = store
-            .lock()
-            .unwrap()
             .cursor(&serial)
             .map_err(|e| storage_failure("read_cursor", e, 0))?;
 
-        let inserted = AtomicU32::new(0);
-        let db_err: Mutex<Option<SyncError>> = Mutex::new(None);
+        let mut inserted = 0;
         progress.on_progress("sync".into(), 0, 0);
-        let first_drain = drain_into_store(
-            &client,
-            cursor,
-            &serial,
-            &store,
-            &inserted,
-            &db_err,
-            progress.as_ref(),
-        )
-        .await;
+        let (store, first_drain) =
+            drain_into_store(&client, cursor, &serial, store, &progress).await;
         let mut rejected_cursor_rebased = false;
-        let mut outcome = match first_drain {
-            Ok(outcome) => outcome,
+        let (mut store, mut outcome) = match first_drain {
+            Ok(drained) => {
+                inserted += drained.inserted;
+                (store, drained.outcome)
+            }
             Err(error) if cursor > 0 && is_rejected_history_cursor(&error.to_string()) => {
                 // Ring 5 rejects a stale/end cursor with ExtGetEvent result 0xff. Older
                 // builds incorrectly treated that as a successful empty terminal batch,
                 // leaving retained history unseen. Rebase transactionally; inserts are
                 // deduplicated, and checkpoint zero makes a reconnect resume recovery.
                 store
-                    .lock()
-                    .unwrap()
                     .set_cursor(&serial, 0)
                     .map_err(|e| storage_failure("rebase_cursor", e, cursor))?;
                 progress.on_progress("rebase".into(), 0, 0);
                 rejected_cursor_rebased = true;
-                drain_into_store(
-                    &client,
-                    0,
-                    &serial,
-                    &store,
-                    &inserted,
-                    &db_err,
-                    progress.as_ref(),
-                )
-                .await?
+                let (store, drained) =
+                    drain_into_store(&client, 0, &serial, store, &progress).await;
+                let drained = drained?;
+                inserted += drained.inserted;
+                (store, drained.outcome)
             }
             Err(error) => return Err(error),
         };
@@ -845,35 +829,29 @@ impl RingSession {
                 // existing reconnect loop resumes the new epoch instead of retrying the
                 // stale/poisoned cursor and reporting another false success.
                 store
-                    .lock()
-                    .unwrap()
                     .set_cursor(&serial, 0)
                     .map_err(|e| storage_failure("rebase_cursor", e, cursor))?;
                 progress.on_progress("rebase".into(), 0, 0);
-                outcome = drain_into_store(
-                    &client,
-                    0,
-                    &serial,
-                    &store,
-                    &inserted,
-                    &db_err,
-                    progress.as_ref(),
-                )
-                .await?;
+                let (rebased, drained) =
+                    drain_into_store(&client, 0, &serial, store, &progress).await;
+                let drained = drained?;
+                store = rebased;
+                inserted += drained.inserted;
+                outcome = drained.outcome;
             }
         }
         // Second, ring-independent anchor: the newest drained ring timestamp is at
         // most minutes old, so pairing it with the phone clock dates this boot even
         // when the firmware never emits time_sync/rtc_beacon events.
         if let Some(anchor) = phone_anchor_event(outcome.events_synced, outcome.next_cursor, now_unix()) {
-            if let Err(error) = store.lock().unwrap().insert_event(&serial, &anchor) {
+            if let Err(error) = store.insert_event(&serial, &anchor) {
                 progress.on_progress(format!("phone anchor not saved: {error}"), 0, 0);
             }
         }
         Ok(SyncReport {
             serial,
             events_synced: outcome.events_synced,
-            inserted: inserted.into_inner(),
+            inserted,
             next_cursor: outcome.next_cursor,
         })
     }
@@ -1073,6 +1051,7 @@ mod tests {
 #[cfg(test)]
 mod raw_event_tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     #[test]
     fn backup_round_trips_through_vacuum_into() {
@@ -1271,19 +1250,16 @@ mod raw_event_tests {
             writer: writer.clone(),
         })
         .with_quiet(std::time::Duration::from_millis(20));
-        let store = Mutex::new(Store::open_in_memory().unwrap());
-        store.lock().unwrap().upsert_device("S1", None, None).unwrap();
-        let inserted = AtomicU32::new(0);
-        let db_err = Mutex::new(None);
-        let progress = NoProgress;
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_device("S1", None, None).unwrap();
+        let progress: Arc<dyn SyncProgressListener> = Arc::new(NoProgress);
 
-        let outcome = drain_into_store(&client, 0, "S1", &store, &inserted, &db_err, &progress)
-            .await
-            .unwrap();
-        assert_eq!(outcome.events_synced, 2);
-        assert_eq!(outcome.next_cursor, 102);
-        assert_eq!(inserted.load(Ordering::Relaxed), 2);
-        assert_eq!(store.lock().unwrap().cursor("S1").unwrap(), 102);
+        let (store, drained) = drain_into_store(&client, 0, "S1", store, &progress).await;
+        let drained = drained.unwrap();
+        assert_eq!(drained.outcome.events_synced, 2);
+        assert_eq!(drained.outcome.next_cursor, 102);
+        assert_eq!(drained.inserted, 2);
+        assert_eq!(store.cursor("S1").unwrap(), 102);
 
         // Now test that a database commit failure on batch 2 preserves batch 1's checkpoint (202)
         // and never advances the cursor to batch 2's cursor (204).
@@ -1326,8 +1302,8 @@ mod raw_event_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("batch.db");
         let _ = std::fs::remove_file(&db_path);
-        let store2 = Mutex::new(Store::open(&db_path).unwrap());
-        store2.lock().unwrap().upsert_device("S1", None, None).unwrap();
+        let store2 = Store::open(&db_path).unwrap();
+        store2.upsert_device("S1", None, None).unwrap();
         // Install a SQLite trigger that aborts when ring_timestamp >= 202 so batch 1 (200..201)
         // commits cleanly at cursor 202 while batch 2 (202..203) rolls back.
         {
@@ -1350,14 +1326,11 @@ mod raw_event_tests {
             writer: writer2,
         })
         .with_quiet(std::time::Duration::from_millis(20));
-        let inserted2 = AtomicU32::new(0);
-        let db_err2 = Mutex::new(None);
-        let err = drain_into_store(&client2, 200, "S1", &store2, &inserted2, &db_err2, &progress)
-            .await
-            .expect_err("second batch must fail");
+        let (store2, drained) = drain_into_store(&client2, 200, "S1", store2, &progress).await;
+        let err = drained.err().expect("second batch must fail");
         assert!(matches!(err, SyncError::Storage { checkpoint: 202, .. }), "{err:?}");
         // Cursor in SQLite must still be 202 (batch 1), NOT 204 (batch 2)!
-        assert_eq!(store2.lock().unwrap().cursor("S1").unwrap(), 202);
+        assert_eq!(store2.cursor("S1").unwrap(), 202);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
