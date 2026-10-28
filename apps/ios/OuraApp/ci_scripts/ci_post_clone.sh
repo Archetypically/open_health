@@ -76,14 +76,15 @@ if [ "${OURA_CI_TORCH:-0}" = "1" ]; then
   # LFS, not even a release on the public repo — so fetch each one from a private
   # store using a token kept in an Xcode Cloud environment variable. The spec
   # hardcodes these names under notes/models/mobile/, so they land there verbatim.
-  : "${MODELS_BASE_URL:?set MODELS_BASE_URL to the private prefix holding the .ptl files}"
+  : "${MODELS_BASE_URL:?set MODELS_BASE_URL to the private prefix holding the model files}"
   : "${MODELS_TOKEN:?set MODELS_TOKEN to the bearer token for that store}"
   mkdir -p "$REPO/notes/models/mobile"
-  for m in sleepnet_moonstone_1_2_0 cva_2_1_0 automatic_activity_detection_3_1_11 \
-           steps_motion_decoder_2_0_0 illness_detection_0_5_1; do
-    echo "    $m.ptl"
+  for f in sleepstaging_2_6_0.ptl sleepstaging_2_6_0_classifier.bin cva_2_1_0.ptl \
+           automatic_activity_detection_3_1_11.ptl steps_motion_decoder_2_0_0.ptl \
+           illness_detection_0_5_1.ptl; do
+    echo "    $f"
     curl -fsSL -H "Authorization: Bearer $MODELS_TOKEN" \
-      "$MODELS_BASE_URL/$m.ptl" -o "$REPO/notes/models/mobile/$m.ptl"
+      "$MODELS_BASE_URL/$f" -o "$REPO/notes/models/mobile/$f"
   done
 fi
 

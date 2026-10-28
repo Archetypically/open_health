@@ -111,7 +111,7 @@ Set these in the workflow's environment:
 |---|---|
 | `OURA_CI_TORCH` | `1` |
 | `LIBTORCH_XCFRAMEWORKS_URL` | release-asset URL of `libtorch-xcframeworks.tar.gz` |
-| `MODELS_BASE_URL` | private prefix holding the five `.ptl` files |
+| `MODELS_BASE_URL` | private prefix holding the six model files |
 | `MODELS_TOKEN` | bearer token for that store |
 
 The script fails fast naming the missing variable, rather than generating a project
@@ -147,8 +147,8 @@ nothing — this repo is public, and a release asset on it is world-readable.
 ### 2. Host the `.ptl` models privately
 
 The models are decrypted Oura weights, so they must never enter git — not a
-commit, not Git LFS, and not a release asset on a public repo. Put all five under
-one private prefix (`sleepnet_moonstone_1_2_0.ptl`, `cva_2_1_0.ptl`,
+commit, not Git LFS, and not a release asset on a public repo. Put all six under
+one private prefix (`sleepstaging_2_6_0.ptl`, `sleepstaging_2_6_0_classifier.bin`, `cva_2_1_0.ptl`,
 `automatic_activity_detection_3_1_11.ptl`, `steps_motion_decoder_2_0_0.ptl`,
 `illness_detection_0_5_1.ptl`) and give CI a bearer token. The specs hardcode those
 names under `notes/models/mobile/`, so CI must write them there verbatim.
