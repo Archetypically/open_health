@@ -342,20 +342,22 @@ impl Store {
             .decoded
             .as_ref()
             .map(|v| serde_json::to_string(v).unwrap_or_default());
-        let changed = self.conn.execute(
+        // Cached: a sync inserts thousands of events per batch while the BLE link
+        // waits for the next request, so re-parsing this per row is pure dead air.
+        let mut insert = self.conn.prepare_cached(
             "INSERT OR IGNORE INTO events
                (serial, tag, name, ring_timestamp, body, decoded_json, captured_unix)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                serial,
-                ev.tag as i64,
-                ev.name,
-                ev.timestamp as i64,
-                ev.body,
-                decoded,
-                now_unix(),
-            ],
         )?;
+        let changed = insert.execute(params![
+            serial,
+            ev.tag as i64,
+            ev.name,
+            ev.timestamp as i64,
+            ev.body,
+            decoded,
+            now_unix(),
+        ])?;
         Ok(changed > 0)
     }
 

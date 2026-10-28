@@ -272,9 +272,11 @@ fn quick_summary(db_path: &str) -> Result<serde_json::Value, String> {
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use oura_link::transport::Transport;
+use oura_link::client::DEFAULT_QUIET;
+use oura_link::transport::{transact_until, Transport};
 use oura_link::OuraClient;
 use oura_protocol::events::RingEvent;
+use oura_protocol::protocol::{self, Packet};
 use oura_store::storage::Store;
 use tokio::sync::{broadcast, watch};
 
@@ -512,6 +514,35 @@ fn should_rebase_cursor(cursor: u32, events_synced: u32, marker_present: bool) -
     cursor > 0 && events_synced == 0 && !marker_present
 }
 
+/// Ring commands answer with their own tag + 1 (0x08→0x09, 0x0c→0x0d, 0x28→0x29), so
+/// a time sync (0x12) is done once 0x13 arrives. oura-link's `sync_time*` use its
+/// untargeted `request`, which always sits out the whole quiet window after the
+/// reply; stopping on the reply saves that on every sync. The quiet window remains
+/// the fallback, so a ring that never answers costs exactly what it did before.
+const TIME_SYNC_REPLY: u8 = 0x13;
+
+async fn time_sync_request<T: Transport>(transport: &T, request: &[u8]) -> oura_link::Result<()> {
+    transact_until(transport, request, DEFAULT_QUIET, |frame| {
+        Packet::parse_many(frame)
+            .iter()
+            .any(|p| p.tag == TIME_SYNC_REPLY)
+    })
+    .await
+    .map(|_| ())
+}
+
+/// `OuraClient::sync_time_app`, terminating on the ring's reply.
+async fn sync_time_app<T: Transport>(transport: &T) -> oura_link::Result<()> {
+    let now = now_unix();
+    let token = (now as u8).wrapping_mul(37).wrapping_add(0xa5);
+    time_sync_request(transport, &protocol::req_sync_time_counter(now, token)).await
+}
+
+/// `OuraClient::sync_time`, terminating on the ring's reply.
+async fn sync_time<T: Transport>(transport: &T) -> oura_link::Result<()> {
+    time_sync_request(transport, &protocol::req_sync_time(now_unix(), 0)).await
+}
+
 fn is_rejected_history_cursor(error: &str) -> bool {
     error.contains("extended history request failed with result code 0xff")
 }
@@ -736,17 +767,16 @@ impl RingSession {
         // `time_sync` is the only wall-clock anchor in the event stream, and it is
         // retroactive — one of them dates every event in the same boot epoch.
         progress.on_progress("time".into(), 0, 0);
-        if let Err(error) = client.sync_time_app().await {
+        if let Err(error) = sync_time_app(client.transport()).await {
             progress.on_progress(format!("time_sync skipped: {error}"), 0, 0);
             // The app-layer command is refused by some firmware; the plain one is not.
-            let _ = client.sync_time().await;
+            let _ = sync_time(client.transport()).await;
         }
-        // Ask the ring to run its sleep analysis before draining. Bedtime periods are
-        // the ONLY thing build_summary turns into nights, and the ring writes one when
-        // it postprocesses a sleep — not while it is recording one. Triggering it here
-        // gives the ring the whole drain to finish, so a fast postprocess lands in this
-        // sync rather than the next. Fire-and-forget: a refusal is not a sync failure.
-        let _ = client.check_sleep_analysis(false).await;
+        // No separate sleep-analysis trigger: `check_sleep_analysis(false)` is the
+        // same `28 01 00` DataFlush that `drain_events` sends (and awaits the 0x29
+        // ACK of) before every batch, so the ring already postprocesses a finished
+        // sleep at the start of the drain. Sending it here as well only added an
+        // untargeted request that always waited out the full quiet window.
         let serial = client.serial().await.unwrap_or_else(|_| "unknown".into());
         let info = client.firmware().await.ok();
 
@@ -1157,6 +1187,31 @@ mod raw_event_tests {
         let mut out = vec![0x11, 0x06, events_received, 0x00];
         out.extend_from_slice(&bytes_left.to_le_bytes());
         out
+    }
+
+    #[tokio::test]
+    async fn time_sync_returns_on_the_reply_not_the_quiet_window() {
+        struct TimeReplyWriter(broadcast::Sender<Vec<u8>>);
+        impl BleWriter for TimeReplyWriter {
+            fn write(&self, data: Vec<u8>) {
+                if data.first() == Some(&0x12) {
+                    let _ = self.0.send(vec![TIME_SYNC_REPLY, 0x01, 0x00]);
+                }
+            }
+        }
+        let (tx, _) = broadcast::channel(8);
+        let transport = FfiTransport {
+            tx: tx.clone(),
+            writer: Arc::new(TimeReplyWriter(tx)),
+        };
+        let started = std::time::Instant::now();
+        sync_time_app(&transport).await.unwrap();
+        sync_time(&transport).await.unwrap();
+        assert!(
+            started.elapsed() < DEFAULT_QUIET,
+            "both time syncs waited {:?}; they should stop on 0x13",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
