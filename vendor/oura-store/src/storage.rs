@@ -188,7 +188,8 @@ impl Store {
         Ok(Self { conn })
     }
 
-    /// Commit a complete protocol batch and its cursor together, before ACK/progress.
+    /// Commit a complete protocol batch and its cursor together, in one transaction,
+    /// before its progress is reported.
     pub fn commit_batch(&self, serial: &str, events: &[RingEvent], cursor: u32) -> Result<u32> {
         let tx = self.conn.unchecked_transaction()?;
         let mut inserted = 0;

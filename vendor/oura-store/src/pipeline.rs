@@ -13,15 +13,17 @@
 //!   until there is room), which bounds memory and keeps the drain at most one
 //!   batch ahead of storage;
 //! - after the first failure nothing more is committed and [`submit`] returns
-//!   `false`, so the drain stops. The ring holds its history until a later request
-//!   asks for it by cursor, so a sync that stops here resumes from the last
-//!   committed batch.
+//!   `false`, so the drain stops at its next batch; a failure in the last batch
+//!   surfaces from [`finish`]. Drains are cursor-addressed and send no history
+//!   ACK, and the ring retains its history (a from-zero rebase replays it), so a
+//!   sync that stops here resumes from the last committed batch.
 //!
 //! [`submit`]: BatchCommitter::submit
+//! [`finish`]: BatchCommitter::finish
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -70,15 +72,29 @@ pub struct BatchCommitter {
 
 impl BatchCommitter {
     /// Move `store` onto a committer thread for `serial`'s drain starting at `cursor`.
-    pub fn spawn(store: Store, serial: &str, cursor: u32) -> Self {
+    /// Fails only when the OS refuses a new thread, handing the store back.
+    pub fn spawn(
+        store: Store,
+        serial: &str,
+        cursor: u32,
+    ) -> std::result::Result<Self, (Store, Error)> {
         // Capacity 1: one batch queued behind the one being committed.
         let (tx, rx) = sync_channel::<Job>(1);
         let failed = Arc::new(AtomicBool::new(false));
         let thread_failed = failed.clone();
         let serial = serial.to_owned();
-        let handle = std::thread::Builder::new()
+        // Parked here rather than moved into the closure, so a failed spawn (which
+        // drops the closure unrun) can still return the store to the caller.
+        let parked = Arc::new(Mutex::new(Some(store)));
+        let thread_store = parked.clone();
+        let spawned = std::thread::Builder::new()
             .name("oura-store-commit".into())
             .spawn(move || {
+                let store = thread_store
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("store parked before spawn");
                 let mut done = Finished {
                     store,
                     inserted: 0,
@@ -106,13 +122,26 @@ impl BatchCommitter {
                     }
                 }
                 done
-            })
-            .expect("spawning the oura-store commit thread");
-        Self {
+            });
+        let handle = match spawned {
+            Ok(handle) => handle,
+            Err(e) => {
+                let store = parked
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("unrun closure leaves the store");
+                return Err((
+                    store,
+                    Error::Storage(format!("starting the commit thread: {e}")),
+                ));
+            }
+        };
+        Ok(Self {
             tx: Some(tx),
             failed,
             handle: Some(handle),
-        }
+        })
     }
 
     /// Queue a complete batch and its cursor. `on_commit` runs on the committer
@@ -164,7 +193,6 @@ impl Drop for BatchCommitter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     fn event(ts: u32) -> RingEvent {
         RingEvent {
@@ -180,7 +208,8 @@ mod tests {
     fn commits_in_order_and_returns_the_store() {
         let store = Store::open_in_memory().unwrap();
         store.upsert_device("S1", None, None).unwrap();
-        let committer = BatchCommitter::spawn(store, "S1", 0);
+        let committer =
+            BatchCommitter::spawn(store, "S1", 0).unwrap_or_else(|_| panic!("spawn failed"));
         let seen = Arc::new(Mutex::new(Vec::new()));
         for batch in 0..5u32 {
             let events = (0..10).map(|i| event(batch * 10 + i)).collect();
@@ -210,7 +239,8 @@ mod tests {
             .conn_for_tests()
             .execute_batch("DROP TABLE events")
             .unwrap();
-        let committer = BatchCommitter::spawn(store, "S1", 7);
+        let committer =
+            BatchCommitter::spawn(store, "S1", 7).unwrap_or_else(|_| panic!("spawn failed"));
         // The thread may not have failed yet when the next batch is offered, so
         // the first one or two submits can be accepted; neither may commit, and
         // a later one must be refused.

@@ -446,9 +446,10 @@ struct Drained {
 /// Drain one incremental range into `store`. Each batch commits with its cursor on
 /// oura-store's committer thread while the drain already requests the next one, so
 /// SQLite no longer leaves the BLE link idle. A failed commit makes the next batch
-/// callback return `false`, which stops the drain, and the stored cursor never
-/// passes data that was not persisted. The store comes back either way, so the
-/// caller can rebase the cursor or write an anchor after a failure.
+/// callback return `false`, which stops the drain (a failure in the last batch is
+/// reported once the committer finishes), and the stored cursor never passes data
+/// that was not persisted. The store comes back on success and on drain or commit
+/// failures, so the caller can rebase the cursor or write an anchor afterwards.
 async fn drain_into_store(
     client: &OuraClient<FfiTransport>,
     cursor: u32,
@@ -456,7 +457,13 @@ async fn drain_into_store(
     store: Store,
     progress: &Arc<dyn SyncProgressListener>,
 ) -> (Store, Result<Drained, SyncError>) {
-    let committer = BatchCommitter::spawn(store, serial, cursor);
+    let committer = match BatchCommitter::spawn(store, serial, cursor) {
+        Ok(committer) => committer,
+        Err((store, error)) => {
+            let error = storage_failure("start_commit_thread", error, cursor);
+            return (store, Err(error));
+        }
+    };
     let batch = Mutex::new(Vec::new());
     let outcome = client
         .drain_events(

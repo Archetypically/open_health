@@ -1002,7 +1002,10 @@ async fn drain_events_into_store(
     cursor: u32,
     inserted: &std::cell::Cell<u32>,
 ) -> (Store, Result<(u32, u32)>) {
-    let committer = BatchCommitter::spawn(store, serial, cursor);
+    let committer = match BatchCommitter::spawn(store, serial, cursor) {
+        Ok(committer) => committer,
+        Err((store, e)) => return (store, Err(e.into())),
+    };
     let pending = std::cell::RefCell::new(Vec::new());
     let batch_started = std::cell::Cell::new(std::time::Instant::now());
     let outcome = client
@@ -1014,11 +1017,10 @@ async fn drain_events_into_store(
             },
             |p| {
                 let link = batch_started.get().elapsed();
-                batch_started.set(std::time::Instant::now());
                 let events = std::mem::take(&mut *pending.borrow_mut());
                 let (count, synced, kb_left) =
                     (events.len(), p.events_synced, p.bytes_left as f64 / 1024.0);
-                committer.submit(events, p.next_cursor, move |c| {
+                let queued = committer.submit(events, p.next_cursor, move |c| {
                     // Per-batch split: tells a slow BLE link apart from slow storage.
                     println!(
                         "  … {synced} events so far, ~{kb_left:.1} KB left on ring \
@@ -1026,7 +1028,11 @@ async fn drain_events_into_store(
                         link.as_secs_f64(),
                         c.elapsed.as_secs_f64(),
                     );
-                })
+                });
+                // After submit: time it spent waiting on the previous commit is
+                // storage, not link, and must not count toward the next batch.
+                batch_started.set(std::time::Instant::now());
+                queued
             },
         )
         .await;
