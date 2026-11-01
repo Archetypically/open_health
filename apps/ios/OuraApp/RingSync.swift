@@ -315,6 +315,9 @@ final class RingSync: ObservableObject {
     @Published var connectionIssue: String?
     @Published var lastReport: SyncReport?
     @Published private(set) var lastSuccessfulSyncAt: Date?
+    /// Drain progress 0…1 for the progress bar, nil until the ring has reported how
+    /// much it holds (after the first batch) or when no drain is running.
+    @Published private(set) var syncFraction: Double?
     /// Serial of the ring this phone last talked to — used to confirm a factory reset
     /// targets THIS ring and not one that merely won the scan.
     @Published private(set) var knownSerial: String? = UserDefaults.standard.string(forKey: "ring.serial")
@@ -334,6 +337,9 @@ final class RingSync: ObservableObject {
     private var lastProgressBytes: UInt64?
     private var lastProgressAt: Date?
     private var smoothedBytesPerSecond: Double?
+    /// Largest `bytesLeft` the ring reported this run: the bar's denominator. It is
+    /// kept across retries, which resume from the checkpoint with less left.
+    private var peakBytesLeft: UInt64 = 0
     private var lastAutomaticAttemptAt: Date?
     private var markedIncompleteThisRun = false
     private var paused = false
@@ -626,6 +632,8 @@ final class RingSync: ObservableObject {
         lastProgressBytes = nil
         lastProgressAt = nil
         smoothedBytesPerSecond = nil
+        peakBytesLeft = 0
+        syncFraction = nil
         let key = keyHex.trimmingCharacters(in: .whitespacesAndNewlines)
         runID = UUID().uuidString
         dlog("sync", "start run=\(runID) source=\(source)")
@@ -647,6 +655,7 @@ final class RingSync: ObservableObject {
         IdleTimerLock.acquire("ring-sync")
         defer {
             busy = false
+            syncFraction = nil
             IdleTimerLock.release("ring-sync")
             pump?.cancel()
             pump = nil
@@ -838,6 +847,13 @@ final class RingSync: ObservableObject {
                 }
                 lastProgressBytes = bytesLeft
                 lastProgressAt = now
+                // The ring reports what is left, never a total, so the largest count
+                // seen is the baseline: the bar starts near 0 one batch in and fills as
+                // the count falls. A larger count later (the ring recorded more, or a
+                // rebase onto a new boot epoch found more to drain) raises the
+                // baseline, so the bar can step back but never leaves 0…1.
+                peakBytesLeft = max(peakBytesLeft, bytesLeft)
+                syncFraction = 1 - Double(bytesLeft) / Double(peakBytesLeft)
                 let eta = smoothedBytesPerSecond.flatMap { rate -> String? in
                     guard rate > 0 else { return nil }
                     return Self.fmtDuration(Double(bytesLeft) / rate)
@@ -845,6 +861,8 @@ final class RingSync: ObservableObject {
                 status = "syncing… ~\(Self.fmtBytes(bytesLeft)) left · \(events) events"
                     + (eta.map { " · about \($0)" } ?? "")
             } else if events > 0 {
+                // drained; only the confirming empty pass and the commit remain
+                if peakBytesLeft > 0 { syncFraction = 1 }
                 status = "syncing… \(events) events · finishing up"
             } else {
                 status = "Syncing…"

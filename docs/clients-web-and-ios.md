@@ -203,6 +203,9 @@ has no `illness`) and the ring-clock warnings (`clock.warnings`). Still iOS-only
 - **Direct reconnect to the remembered ring**: `BLETransport` asks iOS for the last
   synced ring by identifier alongside its scan, so a reconnect does not wait for a
   discovery report. Desktop `oura sync` (btleplug in `oura-link`) still scans every time.
+- **Sync progress bar**: the sync card shows a percentage from the ring's per-batch
+  `bytes_left`, measured against the largest value seen during the run. The web Sync
+  button shows no progress.
 - **Sleep score + breathing rate** (`nights[].sleep_score`, `breath_rate`).
 - **Skin temperature / latest HR vitals and trend pages**, **hourly heart rate**
   (`hourly_hr` is FFI-only; no `/api` endpoint yet).

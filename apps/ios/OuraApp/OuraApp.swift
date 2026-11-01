@@ -388,6 +388,19 @@ struct SyncView: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(ring.busy ? "Sync in progress" : (ring.connectionIssue ?? (ring.lastReport != nil ? "Your ring is up to date" : "Sync status")))
                         .font(.subheadline.weight(.semibold)).foregroundStyle(Obs.ink)
+                    if ring.busy, let fraction = ring.syncFraction {
+                        HStack(spacing: 10) {
+                            ProgressView(value: fraction)
+                                .tint(Obs.ink)
+                                .animation(.easeOut(duration: 0.4), value: fraction)
+                            Text("\(Int((fraction * 100).rounded(.down)))%")
+                                .font(Obs.mono(12)).foregroundStyle(Obs.ink2)
+                                .monospacedDigit()
+                        }
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel("Sync progress")
+                        .accessibilityValue("\(Int((fraction * 100).rounded(.down))) percent")
+                    }
                     Text(ring.status)
                         .font(.subheadline).foregroundStyle(Obs.ink2)
                         .fixedSize(horizontal: false, vertical: true)
