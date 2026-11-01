@@ -23,6 +23,22 @@ enum OvernightSync {
     /// When the task last launched (epoch seconds). `schedule()` measures the gap from
     /// it, so the app going to the background cannot reset the spacing.
     private static let lastLaunchKey = "overnight.last-launch"
+    /// The last launch's outcome, for the line on the sync screen.
+    private static let lastResultAtKey = "overnight.last-result-at"
+    private static let lastResultKey = "overnight.last-result"
+
+    /// "Last overnight sync …" for the sync screen, nil until the task has run once.
+    static var lastResultLine: String? {
+        let at = UserDefaults.standard.double(forKey: lastResultAtKey)
+        guard at > 0, let text = UserDefaults.standard.string(forKey: lastResultKey) else { return nil }
+        let when = Date(timeIntervalSince1970: at).formatted(.relative(presentation: .named))
+        return "Last overnight sync \(when): \(text)"
+    }
+
+    private static func record(_ text: String) {
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: lastResultAtKey)
+        UserDefaults.standard.set(text, forKey: lastResultKey)
+    }
 
     /// Register the launch handler. Apple requires this before the app finishes
     /// launching, so it is called from `OuraApp.init`.
@@ -65,6 +81,7 @@ enum OvernightSync {
         guard Keychain.loadKey() != nil else {
             // Nothing to drain with, and rescheduling would just wake the app all night.
             dlog("overnight", "launched but the ring key is unreadable; not rescheduling")
+            record("skipped, the ring key could not be read. Open the app to re-enable.")
             task.setTaskCompleted(success: false)
             return
         }
@@ -78,6 +95,12 @@ enum OvernightSync {
             let report = await ring.runInBackground()
             if let report {
                 dlog("overnight", "done inserted=\(report.inserted) events=\(report.eventsSynced)")
+                record(report.inserted == 0 ? "nothing new on the ring"
+                       : "\(report.inserted.formatted()) new readings saved")
+            } else if Task.isCancelled {
+                record("iOS ended it partway; the rest syncs on the next run")
+            } else {
+                record("didn’t finish. \(ring.status.isEmpty ? "See Technical reports." : ring.status)")
             }
             done.finish(success: report != nil)
         }

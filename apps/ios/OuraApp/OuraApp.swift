@@ -451,6 +451,11 @@ struct SyncView: View {
                     .font(.footnote).foregroundStyle(Obs.ink2)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if let overnight = OvernightSync.lastResultLine {
+                Label(overnight, systemImage: "moon.zzz")
+                    .font(.footnote).foregroundStyle(Obs.ink2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
