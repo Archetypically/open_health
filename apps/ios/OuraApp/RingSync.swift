@@ -342,6 +342,14 @@ final class RingSync: ObservableObject {
     /// Drain progress 0…1 for the progress bar, nil until the ring has reported how
     /// much it holds (after the first batch) or when no drain is running.
     @Published private(set) var syncFraction: Double?
+    /// The ring's feature modes as last read (each sync, and after every switch):
+    /// `spo2`, `daytime_hr`, … → 0 off, 1 automatic, 2 requested, 3 live.
+    @Published private(set) var featureModes: [String: Int] = [:]
+    /// The feature being switched right now, for its row's spinner.
+    @Published private(set) var switchingFeature: String?
+    @Published private(set) var featureMessage: String?
+    /// A sync (not a feature switch) holds the ring link.
+    var isSyncing: Bool { busy && switchingFeature == nil }
     /// Serial of the ring this phone last talked to — used to confirm a factory reset
     /// targets THIS ring and not one that merely won the scan.
     @Published private(set) var knownSerial: String? = UserDefaults.standard.string(forKey: "ring.serial")
@@ -378,10 +386,14 @@ final class RingSync: ObservableObject {
     private var lifecycleObservers: [NSObjectProtocol] = []
 
     func pause() {
-        paused = true
+        // A feature switch stopped by backgrounding is not a paused sync: it reports
+        // its own failure and must not leave `paused` set for the next one.
+        if switchingFeature == nil {
+            paused = true
+            status = "Sync paused. Return to the app to resume."
+        }
         session?.cancel(reason: "paused")
         transport?.abort()
-        status = "Sync paused. Return to the app to resume."
     }
 
 
@@ -405,6 +417,7 @@ final class RingSync: ObservableObject {
         }
         let timestamp = UserDefaults.standard.double(forKey: Self.lastSuccessfulSyncKey)
         lastSuccessfulSyncAt = timestamp > 0 ? Date(timeIntervalSince1970: timestamp) : nil
+        loadFeatureModes()
     }
 
     var wasRecentlySynced: Bool {
@@ -520,6 +533,72 @@ final class RingSync: ObservableObject {
         UserDefaults.standard.set(serial, forKey: "ring.serial")
     }
 
+    /// Re-read the saved feature-mode snapshot (written by every sync and switch).
+    func loadFeatureModes() {
+        let json = featureModesJson(dbPath: DB.url.path)
+        let object = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any] ?? [:]
+        featureModes = object.compactMapValues { ($0 as? NSNumber)?.intValue }
+            .filter { !$0.key.hasPrefix("_") }
+    }
+
+    /// Switch one ring feature on (automatic) or off over a short connection of its
+    /// own: authenticate, send the mode, read every mode back. Shares the single BLE
+    /// link with sync, so it refuses while one runs (and an overnight run that wakes
+    /// during a switch skips itself on `busy`, then syncs at its next launch).
+    @discardableResult
+    func setFeature(_ feature: String, enabled: Bool) async -> Bool {
+        guard !busy else { featureMessage = "Wait for the sync to finish, then try again."; return false }
+        guard WorkCoordinator.shared.available else { featureMessage = "Open the app to change this."; return false }
+        guard let key = Keychain.loadKey() else { featureMessage = "Sync with your ring first."; return false }
+        busy = true
+        switchingFeature = feature
+        featureMessage = nil
+        defer {
+            busy = false
+            switchingFeature = nil
+            // `pause()` on backgrounding opened this; a switch never ends up in `run`.
+            WorkCoordinator.shared.endCleanup()
+            pump?.cancel()
+            pump = nil
+            transport?.disconnect()
+            transport = nil
+            session = nil
+        }
+        dlog("feature", "\(feature) → \(enabled ? "automatic" : "off")")
+        let t = BLETransport(nameContains: "Oura", preferredPeripheralID: preferredPeripheralID)
+        transport = t
+        do {
+            try await t.connect()
+        } catch {
+            dlog("feature", "BLE connect FAILED: \(error)")
+            featureMessage = "Couldn’t reach your ring. Keep it nearby (on its charger is most reliable) and try again."
+            return false
+        }
+        let s = RingSession(writer: RingWriter(t))
+        session = s
+        let frames = t.notifications
+        pump = Task {
+            for await frame in frames { s.pushFrame(data: frame) }
+            s.cancel(reason: "transport closed")
+        }
+        do {
+            _ = try await s.setFeature(dbPath: DB.url.path, keyHex: key, feature: feature, enabled: enabled)
+            connectionIssue = nil   // it just connected and authenticated
+            loadFeatureModes()
+            dlog("feature", "OK \(feature) modes=\(featureModes)")
+            return true
+        } catch {
+            dlog("feature", "FAILED: \(error)")
+            loadFeatureModes()   // the change may have landed before the failure (Rust saves it on the ring's ack)
+            switch error {
+            case SyncError.Failed(let message): featureMessage = "Couldn’t change the setting: \(message)"
+            case SyncError.Interrupted: featureMessage = "The change was interrupted. Try again."
+            default: featureMessage = "Couldn’t change the setting: \(error)"
+            }
+            return false
+        }
+    }
+
     /// **DESTRUCTIVE.** Wipe the ring back to factory state. Erases its auth key, every
     /// Bluetooth bond, the events it still holds and the stored body profile. The saved
     /// key is dropped from the Keychain afterwards because it no longer opens anything.
@@ -571,6 +650,10 @@ final class RingSync: ObservableObject {
             let serial = try await s.factoryReset(keyHex: keyHex, confirmSerial: confirmSerial)
             Keychain.clearKey()
             UserDefaults.standard.removeObject(forKey: Self.preferredPeripheralKey)
+            // The snapshot described the ring that was just wiped; the next sync rewrites it.
+            try? FileManager.default.removeItem(
+                at: DB.url.deletingLastPathComponent().appendingPathComponent("feature_modes.json"))
+            featureModes = [:]
             lastReport = nil
             dlog("reset", "wiped \(serial)")
             status = "\(serial) wiped. Its old key is gone — pair it again to start over."
@@ -678,6 +761,7 @@ final class RingSync: ObservableObject {
         // again after the user opened it mid-run).
         let canWork = { background || WorkCoordinator.shared.available }
         connectionIssue = nil
+        featureMessage = nil
         lastReport = nil   // clear any prior success so a failed retry isn't read as one
         lastProgressBytes = nil
         lastProgressAt = nil
@@ -813,6 +897,7 @@ final class RingSync: ObservableObject {
                 rememberPeripheral(t.connectedPeripheralID)
 
                 lastReport = report
+                loadFeatureModes()
                 let completedAt = Date()
                 lastSuccessfulSyncAt = completedAt
                 UserDefaults.standard.set(completedAt.timeIntervalSince1970,

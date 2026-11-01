@@ -316,6 +316,11 @@ uint64_t uniffi_oura_core_fn_method_ringsession_pair(void*_Nonnull ptr, RustBuff
 void uniffi_oura_core_fn_method_ringsession_push_frame(void*_Nonnull ptr, RustBuffer data, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_SET_FEATURE
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_SET_FEATURE
+uint64_t uniffi_oura_core_fn_method_ringsession_set_feature(void*_Nonnull ptr, RustBuffer db_path, RustBuffer key_hex, RustBuffer feature, int8_t enabled
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_SYNC
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_SYNC
 uint64_t uniffi_oura_core_fn_method_ringsession_sync(void*_Nonnull ptr, RustBuffer db_path, RustBuffer key_hex, uint64_t progress
@@ -360,6 +365,11 @@ RustBuffer uniffi_oura_core_fn_func_events_json(RustBuffer db_path, RustBuffer n
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_EXPORT_DATABASE
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_EXPORT_DATABASE
 void uniffi_oura_core_fn_func_export_database(RustBuffer db_path, RustBuffer out_path, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_FEATURE_MODES_JSON
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_FEATURE_MODES_JSON
+RustBuffer uniffi_oura_core_fn_func_feature_modes_json(RustBuffer db_path, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_HOURLY_HR_JSON
@@ -703,6 +713,12 @@ uint16_t uniffi_oura_core_checksum_func_export_database(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_FEATURE_MODES_JSON
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_FEATURE_MODES_JSON
+uint16_t uniffi_oura_core_checksum_func_feature_modes_json(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_HOURLY_HR_JSON
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_HOURLY_HR_JSON
 uint16_t uniffi_oura_core_checksum_func_hourly_hr_json(void
@@ -754,6 +770,12 @@ uint16_t uniffi_oura_core_checksum_method_ringsession_pair(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_PUSH_FRAME
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_PUSH_FRAME
 uint16_t uniffi_oura_core_checksum_method_ringsession_push_frame(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_SET_FEATURE
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_SET_FEATURE
+uint16_t uniffi_oura_core_checksum_method_ringsession_set_feature(void
     
 );
 #endif

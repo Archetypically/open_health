@@ -207,6 +207,11 @@ has no `illness`) and the ring-clock warnings (`clock.warnings`). Still iOS-only
   runs only while the phone is idle and on power drains the ring a few times a night, so
   the morning sync is small. The ring key is stored `AfterFirstUnlock` so the locked
   phone can read it. The web has no equivalent: `oura sync` runs only on demand.
+- **Ring feature switches**: the sync screen's "Ring features" card turns blood oxygen,
+  daytime HR and workout HR on or off (`RingSession.set_feature`, a short connection of
+  its own). iOS syncs now also save the on-ring modes to `feature_modes.json`, as desktop
+  `oura sync` already did. The web has no BLE; on desktop use `oura feature-mode <feature>
+  <mode>`.
 - **Sync progress bar**: the sync card shows a percentage from the ring's per-batch
   `bytes_left`, measured against the largest value seen during the run. The web Sync
   button shows no progress.

@@ -555,6 +555,123 @@ fn is_rejected_history_cursor(error: &str) -> bool {
     error.contains("extended history request failed with result code 0xff")
 }
 
+/// The data features whose on-ring mode is snapshotted to `feature_modes.json` and can
+/// be switched from the app: `(SetFeatureMode id, name)`. Same table as the desktop
+/// `oura feature-status`, so both clients write the same keys.
+const RING_FEATURES: [(u8, &str); 7] = [
+    (0x02, "daytime_hr"),
+    (0x03, "exercise_hr"),
+    (0x04, "spo2"),
+    (0x08, "resting_hr"),
+    (0x0b, "real_steps"),
+    (0x0c, "experimental"),
+    (0x0d, "cva_ppg"),
+];
+
+/// The subset the app offers as switches, each feeding something the summary already
+/// computes. The rest stay read-only: `resting_hr` is part of the ring's baseline sleep
+/// measurement, `experimental` has no known effect, and `real_steps` / `cva_ppg` only
+/// feed Oura models (step decoder, cardiovascular age) that a model-free build lacks,
+/// while costing battery and, for raw PPG, much larger syncs.
+const SWITCHABLE_FEATURES: [&str; 3] = ["spo2", "daytime_hr", "exercise_hr"];
+
+/// A feature's current mode (`feature_mode::*`), returning on the ring's ext `0x21`
+/// status packet instead of waiting out the quiet window. `None` if it never answered.
+/// The packet must name `id`: a late reply to the previous, timed-out read must not
+/// be taken for this one's.
+async fn read_feature_mode<T: Transport>(transport: &T, id: u8) -> Option<u8> {
+    let is_status =
+        |p: &Packet| p.ext_tag() == Some(0x21) && p.payload.len() >= 6 && p.payload[1] == id;
+    let frames = transact_until(transport, &protocol::req_feature_status(id), DEFAULT_QUIET, |frame| {
+        Packet::parse_many(frame).iter().any(is_status)
+    })
+    .await
+    .ok()?;
+    frames
+        .iter()
+        .flat_map(|frame| Packet::parse_many(frame))
+        .find(is_status)
+        .map(|p| p.payload[2])
+}
+
+/// How long the feature-mode snapshot may keep asking after a sync's data is already
+/// saved. A ring answers each read in well under a second; one that ignores some
+/// features would otherwise cost a full quiet window apiece, past the few seconds iOS
+/// gives an overnight run to wind down.
+const FEATURE_READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Every feature in [`RING_FEATURES`] the ring reported, as `{ name: mode }`; stops
+/// asking once [`FEATURE_READ_BUDGET`] is spent.
+async fn read_feature_modes<T: Transport>(transport: &T) -> serde_json::Map<String, serde_json::Value> {
+    let started = std::time::Instant::now();
+    let mut modes = serde_json::Map::new();
+    for (id, name) in RING_FEATURES {
+        if started.elapsed() >= FEATURE_READ_BUDGET {
+            break;
+        }
+        if let Some(mode) = read_feature_mode(transport, id).await {
+            modes.insert(name.to_string(), json!(mode));
+        }
+    }
+    modes
+}
+
+/// Save `read` over the previous snapshot, so a feature the ring did not answer for
+/// keeps its last known mode instead of vanishing from the file. `acknowledged` pins a
+/// mode the ring just accepted (a switch) when its read-back is missing.
+fn save_feature_modes(
+    db_path: &str,
+    read: serde_json::Map<String, serde_json::Value>,
+    acknowledged: Option<(&str, u8)>,
+) {
+    let db = std::path::Path::new(db_path);
+    let mut modes = match oura_summary::read_feature_modes(db) {
+        serde_json::Value::Object(previous) => previous,
+        _ => serde_json::Map::new(),
+    };
+    if let Some((name, mode)) = acknowledged {
+        modes.insert(name.to_string(), json!(mode));
+    }
+    modes.extend(read);
+    if !modes.is_empty() {
+        oura_summary::write_feature_modes(db, modes);
+    }
+}
+
+/// `SetFeatureMode`, returning on the ring's ext `0x23` reply. Result byte 0 is success.
+async fn write_feature_mode<T: Transport>(transport: &T, id: u8, mode: u8) -> Result<(), String> {
+    let is_reply = |p: &Packet| p.ext_tag() == Some(0x23);
+    let frames = transact_until(
+        transport,
+        &protocol::req_set_feature_mode(id, mode),
+        DEFAULT_QUIET,
+        |frame| Packet::parse_many(frame).iter().any(is_reply),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    match frames
+        .iter()
+        .flat_map(|frame| Packet::parse_many(frame))
+        .find(is_reply)
+        .and_then(|p| p.payload.get(2).copied())
+    {
+        Some(0x00) => Ok(()),
+        Some(code) => Err(format!("the ring refused the change (result {code:#04x})")),
+        None => Err("the ring did not answer the change".into()),
+    }
+}
+
+/// The on-ring feature modes saved at the last sync or switch, as the JSON object
+/// `{ "spo2": 1, "daytime_hr": 1, …, "_at": unix_secs }` (`{}` before the first).
+/// Modes: 0 off, 1 automatic, 2 requested, 3 connected live.
+#[uniffi::export]
+pub fn feature_modes_json(db_path: String) -> String {
+    match oura_summary::read_feature_modes(std::path::Path::new(&db_path)) {
+        serde_json::Value::Null => "{}".into(),
+        modes => modes.to_string(),
+    }
+}
+
 #[uniffi::export(async_runtime = "tokio")]
 impl RingSession {
     #[uniffi::constructor]
@@ -654,6 +771,30 @@ impl RingSession {
             result = self.factory_reset_inner(key_hex, confirm_serial) => result,
         }
     }
+
+    /// Switch one ring feature (`spo2`, `daytime_hr`, `exercise_hr`) to
+    /// automatic (`enabled`) or off, over the already-connected link. Reads every
+    /// feature's mode back afterwards, saves that snapshot next to the DB at `db_path`
+    /// (what the summary's "measuring" list and the app's switches show), and returns
+    /// it as the same JSON object [`feature_modes_json`] does.
+    pub async fn set_feature(
+        &self,
+        db_path: String,
+        key_hex: String,
+        feature: String,
+        enabled: bool,
+    ) -> Result<String, SyncError> {
+        let mut stop = self.stop.subscribe();
+        if let Some(reason) = stop.borrow().clone() {
+            return Err(SyncError::Interrupted { reason });
+        }
+        tokio::select! {
+            biased;
+            _ = stop.changed() => Err(SyncError::Interrupted {
+                reason: stop.borrow().clone().unwrap_or_else(|| "cancelled".into()) }),
+            result = self.set_feature_inner(db_path, key_hex, feature, enabled) => result,
+        }
+    }
 }
 
 impl RingSession {
@@ -661,6 +802,47 @@ impl RingSession {
     /// `oura-protocol` — upstream deliberately keeps it out of the shared protocol
     /// crate so nothing that merely links the decoder can emit it.
     const FACTORY_RESET_REQUEST: [u8; 2] = [0x1a, 0x00];
+
+    async fn set_feature_inner(
+        &self,
+        db_path: String,
+        key_hex: String,
+        feature: String,
+        enabled: bool,
+    ) -> Result<String, SyncError> {
+        let fail = SyncError::Failed;
+        let id = RING_FEATURES
+            .iter()
+            .find(|(_, name)| *name == feature)
+            .filter(|(_, name)| SWITCHABLE_FEATURES.contains(name))
+            .map(|(id, _)| *id)
+            .ok_or_else(|| fail(format!("{feature} cannot be switched from the app")))?;
+        let key = parse_key(&key_hex)
+            .ok_or_else(|| fail("auth key must be 32 hex chars".into()))?;
+        let transport = FfiTransport {
+            tx: self.tx.clone(),
+            writer: self.writer.clone(),
+        };
+        let client = OuraClient::new(transport);
+        client
+            .authenticate(&key)
+            .await
+            .map_err(|e| fail(format!("authenticating: {e}")))?;
+        let mode = if enabled {
+            protocol::feature_mode::AUTOMATIC
+        } else {
+            protocol::feature_mode::OFF
+        };
+        write_feature_mode(client.transport(), id, mode)
+            .await
+            .map_err(|e| fail(format!("switching {feature}: {e}")))?;
+        // Record the acknowledged mode before the read-back, which a dropped link or a
+        // cancel can cut short; then the read-back wins, so the file reflects the ring.
+        save_feature_modes(&db_path, serde_json::Map::new(), Some((&feature, mode)));
+        let modes = read_feature_modes(client.transport()).await;
+        save_feature_modes(&db_path, modes, Some((&feature, mode)));
+        Ok(feature_modes_json(db_path))
+    }
 
     async fn factory_reset_inner(
         &self,
@@ -855,6 +1037,12 @@ impl RingSession {
                 progress.on_progress(format!("phone anchor not saved: {error}"), 0, 0);
             }
         }
+        // Snapshot the real on-ring feature modes, as the desktop `oura sync` does, so
+        // the app shows what the ring is actually measuring. Each read returns on the
+        // ring's status packet; best-effort, a ring that does not answer keeps the
+        // previous snapshot.
+        let modes = read_feature_modes(client.transport()).await;
+        save_feature_modes(&db_path, modes, None);
         Ok(SyncReport {
             serial,
             events_synced: outcome.events_synced,
@@ -1338,6 +1526,99 @@ mod raw_event_tests {
         assert!(matches!(err, SyncError::Storage { checkpoint: 202, .. }), "{err:?}");
         // Cursor in SQLite must still be 202 (batch 1), NOT 204 (batch 2)!
         assert_eq!(store2.cursor("S1").unwrap(), 202);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Answers `SetFeatureMode` / `GetFeatureStatus` like a ring: `modes` are its
+    /// (feature, mode) pairs; a status request for a feature it does not list gets no
+    /// answer, and `misnamed` makes it answer a request with the wrong feature id.
+    struct FeatureRing {
+        tx: broadcast::Sender<Vec<u8>>,
+        modes: Vec<(u8, u8)>,
+        set_result: u8,
+        misnamed: bool,
+    }
+    impl BleWriter for FeatureRing {
+        fn write(&self, data: Vec<u8>) {
+            match data.as_slice() {
+                [0x2f, 0x02, 0x20, id] => {
+                    if let Some((_, mode)) = self.modes.iter().find(|(f, _)| f == id) {
+                        let named = if self.misnamed { id ^ 0x01 } else { *id };
+                        let _ = self.tx.send(vec![0x2f, 0x06, 0x21, named, *mode, 0, 0, 0]);
+                    }
+                }
+                [0x2f, 0x03, 0x22, id, _] => {
+                    let _ = self.tx.send(vec![0x2f, 0x03, 0x23, *id, self.set_result]);
+                }
+                _ => {}
+            }
+        }
+    }
+    fn feature_ring(modes: &[(u8, u8)], set_result: u8, misnamed: bool) -> FfiTransport {
+        let (tx, _) = broadcast::channel(16);
+        FfiTransport {
+            tx: tx.clone(),
+            writer: Arc::new(FeatureRing { tx, modes: modes.to_vec(), set_result, misnamed }),
+        }
+    }
+
+    #[tokio::test]
+    async fn feature_modes_are_read_from_each_status_packet_without_waiting() {
+        let mut answers: Vec<(u8, u8)> = RING_FEATURES.iter().map(|(id, _)| (*id, 0)).collect();
+        answers[0].1 = 1; // daytime_hr
+        answers[2].1 = 3; // spo2
+        let ring = feature_ring(&answers, 0, false);
+        let started = std::time::Instant::now();
+        let modes = read_feature_modes(&ring).await;
+        assert_eq!(modes.get("daytime_hr"), Some(&json!(1)));
+        assert_eq!(modes.get("exercise_hr"), Some(&json!(0)));
+        assert_eq!(modes.get("spo2"), Some(&json!(3)));
+        assert_eq!(modes.len(), RING_FEATURES.len(), "{modes:?}");
+        assert!(started.elapsed() < DEFAULT_QUIET, "waited out a quiet window: {:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn a_status_naming_another_feature_is_not_this_ones_mode() {
+        let ring = feature_ring(&[(0x04, 1)], 0, true);
+        assert_eq!(read_feature_mode(&ring, 0x04).await, None);
+    }
+
+    #[tokio::test]
+    async fn set_feature_mode_reports_the_rings_result() {
+        let accepted = feature_ring(&[], 0x00, false);
+        assert_eq!(write_feature_mode(&accepted, 0x04, 1).await, Ok(()));
+        let refused = feature_ring(&[], 0x02, false);
+        let error = write_feature_mode(&refused, 0x04, 1).await.unwrap_err();
+        assert!(error.contains("0x02"), "{error}");
+    }
+
+    #[test]
+    fn saved_feature_modes_merge_over_the_previous_snapshot() {
+        let dir = std::env::temp_dir().join(format!("oura-core-features-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("oura.db").to_string_lossy().into_owned();
+        let read = |pairs: &[(&str, u8)]| {
+            pairs.iter().map(|(k, v)| (k.to_string(), json!(*v))).collect::<serde_json::Map<_, _>>()
+        };
+        assert_eq!(feature_modes_json(db.clone()), "{}");
+        save_feature_modes(&db, read(&[]), None);
+        assert_eq!(feature_modes_json(db.clone()), "{}", "nothing read, nothing written");
+
+        save_feature_modes(&db, read(&[("spo2", 1), ("daytime_hr", 1)]), None);
+        // A later snapshot that only heard from one feature keeps the other's last mode.
+        save_feature_modes(&db, read(&[("daytime_hr", 0)]), None);
+        let saved: serde_json::Value = serde_json::from_str(&feature_modes_json(db.clone())).unwrap();
+        assert_eq!(saved["spo2"], json!(1));
+        assert_eq!(saved["daytime_hr"], json!(0));
+
+        // A switch whose read-back is missing still records what the ring accepted...
+        save_feature_modes(&db, read(&[]), Some(("spo2", 0)));
+        // ...but never overrides what the read-back says.
+        save_feature_modes(&db, read(&[("daytime_hr", 1)]), Some(("daytime_hr", 0)));
+        let saved: serde_json::Value = serde_json::from_str(&feature_modes_json(db)).unwrap();
+        assert_eq!(saved["spo2"], json!(0));
+        assert_eq!(saved["daytime_hr"], json!(1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

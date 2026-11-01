@@ -626,6 +626,15 @@ public protocol RingSessionProtocol : AnyObject {
     func pushFrame(data: Data) 
     
     /**
+     * Switch one ring feature (`spo2`, `daytime_hr`, `exercise_hr`) to
+     * automatic (`enabled`) or off, over the already-connected link. Reads every
+     * feature's mode back afterwards, saves that snapshot next to the DB at `db_path`
+     * (what the summary's "measuring" list and the app's switches show), and returns
+     * it as the same JSON object [`feature_modes_json`] does.
+     */
+    func setFeature(dbPath: String, keyHex: String, feature: String, enabled: Bool) async throws  -> String
+    
+    /**
      * Authenticate, set up the app stream, and drain history events into the DB at
      * `db_path`. `key_hex` is the 32-char ring auth key. `progress` receives stage
      * changes and per-batch drain progress. Returns the sync counts.
@@ -778,6 +787,30 @@ open func pushFrame(data: Data) {try! rustCall() {
         FfiConverterData.lower(data),$0
     )
 }
+}
+    
+    /**
+     * Switch one ring feature (`spo2`, `daytime_hr`, `exercise_hr`) to
+     * automatic (`enabled`) or off, over the already-connected link. Reads every
+     * feature's mode back afterwards, saves that snapshot next to the DB at `db_path`
+     * (what the summary's "measuring" list and the app's switches show), and returns
+     * it as the same JSON object [`feature_modes_json`] does.
+     */
+open func setFeature(dbPath: String, keyHex: String, feature: String, enabled: Bool)async throws  -> String {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_oura_core_fn_method_ringsession_set_feature(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(dbPath),FfiConverterString.lower(keyHex),FfiConverterString.lower(feature),FfiConverterBool.lower(enabled)
+                )
+            },
+            pollFunc: ffi_oura_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_oura_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_oura_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeSyncError.lift
+        )
 }
     
     /**
@@ -1539,6 +1572,18 @@ public func exportDatabase(dbPath: String, outPath: String)throws  {try rustCall
 }
 }
 /**
+ * The on-ring feature modes saved at the last sync or switch, as the JSON object
+ * `{ "spo2": 1, "daytime_hr": 1, …, "_at": unix_secs }` (`{}` before the first).
+ * Modes: 0 off, 1 automatic, 2 requested, 3 connected live.
+ */
+public func featureModesJson(dbPath: String) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_oura_core_fn_func_feature_modes_json(
+        FfiConverterString.lower(dbPath),$0
+    )
+})
+}
+/**
  * Hourly heart-rate bars for the HR detail screen — one bar per local-clock
  * hour, `{low, high, mean, count}`, plus the newest quality-gated
  * reading as `latest`.
@@ -1651,6 +1696,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_oura_core_checksum_func_export_database() != 30024) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_oura_core_checksum_func_feature_modes_json() != 55148) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_oura_core_checksum_func_hourly_hr_json() != 21410) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -1676,6 +1724,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_oura_core_checksum_method_ringsession_push_frame() != 19557) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_oura_core_checksum_method_ringsession_set_feature() != 61141) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_oura_core_checksum_method_ringsession_sync() != 10321) {

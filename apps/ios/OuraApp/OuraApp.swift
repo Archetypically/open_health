@@ -226,6 +226,7 @@ struct SyncView: View {
                     else { preparation }
                     if !ring.busy { pairingKey }
                     connection
+                    ringFeatures
                     support
                     BuildStamp()
                 }
@@ -376,9 +377,9 @@ struct SyncView: View {
 
     @ViewBuilder
     private var syncStatus: some View {
-        if ring.busy || !ring.status.isEmpty {
+        if ring.isSyncing || !ring.status.isEmpty {
             HStack(alignment: .top, spacing: 12) {
-                if ring.busy {
+                if ring.isSyncing {
                     ProgressView().tint(Obs.ink).frame(width: 24, height: 24)
                 } else {
                     Image(systemName: ring.lastReport != nil ? "checkmark.circle" : "info.circle")
@@ -386,9 +387,9 @@ struct SyncView: View {
                         .foregroundStyle(ring.lastReport != nil ? Obs.good : Obs.ink2)
                 }
                 VStack(alignment: .leading, spacing: 6) {
-                    Text(ring.busy ? "Sync in progress" : (ring.connectionIssue ?? (ring.lastReport != nil ? "Your ring is up to date" : "Sync status")))
+                    Text(ring.isSyncing ? "Sync in progress" : (ring.connectionIssue ?? (ring.lastReport != nil ? "Your ring is up to date" : "Sync status")))
                         .font(.subheadline.weight(.semibold)).foregroundStyle(Obs.ink)
-                    if ring.busy, let fraction = ring.syncFraction {
+                    if ring.isSyncing, let fraction = ring.syncFraction {
                         HStack(spacing: 10) {
                             ProgressView(value: fraction)
                                 .tint(Obs.ink)
@@ -404,7 +405,7 @@ struct SyncView: View {
                     Text(ring.status)
                         .font(.subheadline).foregroundStyle(Obs.ink2)
                         .fixedSize(horizontal: false, vertical: true)
-                    if ring.busy {
+                    if ring.isSyncing {
                         Text("Keep the app open. If the connection drops, sync resumes automatically.")
                             .font(.footnote).foregroundStyle(Obs.ink2)
                             .fixedSize(horizontal: false, vertical: true)
@@ -420,7 +421,7 @@ struct SyncView: View {
     private var connection: some View {
         VStack(alignment: .leading, spacing: 16) {
             if ring.connectionIssue == nil { syncStatus }
-            if ring.busy {
+            if ring.isSyncing {
                 Button { ring.pause() } label: {
                     Label("Pause sync", systemImage: "pause")
                         .font(.body.weight(.medium))
@@ -446,7 +447,7 @@ struct SyncView: View {
                     .background(validKey ? Obs.ink : Obs.rule, in: RoundedRectangle(cornerRadius: 14))
                 }
                 .buttonStyle(.plain)
-                .disabled(!validKey)
+                .disabled(!validKey || ring.busy)
                 Text("Your first sync may take a few minutes.")
                     .font(.footnote).foregroundStyle(Obs.ink2)
                     .fixedSize(horizontal: false, vertical: true)
@@ -456,6 +457,32 @@ struct SyncView: View {
                     .font(.footnote).foregroundStyle(Obs.ink2)
                     .fixedSize(horizontal: false, vertical: true)
             }
+        }
+    }
+
+    /// What the ring measures, switchable here because each change goes to the ring
+    /// over its own short connection, like a sync. The modes shown are the ring's own,
+    /// read back after every sync and switch.
+    private var ringFeatures: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Ring features")
+                .font(.subheadline.weight(.semibold)).foregroundStyle(Obs.ink)
+            VStack(spacing: 0) {
+                ForEach(Array(RingFeature.all.enumerated()), id: \.element.id) { index, feature in
+                    if index > 0 { SupportDivider() }
+                    RingFeatureRow(feature: feature,
+                                   mode: ring.featureModes[feature.id],
+                                   switching: ring.switchingFeature == feature.id,
+                                   disabled: ring.busy || !validKey) { enabled in
+                        Task { await ring.setFeature(feature.id, enabled: enabled) }
+                    }
+                }
+            }
+            .background(Obs.rule.opacity(0.3), in: RoundedRectangle(cornerRadius: 16))
+            Text(ring.featureMessage
+                 ?? "Changes are sent to the ring right away. Keep it nearby; each takes a few seconds.")
+                .font(.footnote).foregroundStyle(ring.featureMessage == nil ? Obs.muted : Obs.bad)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -594,6 +621,59 @@ private struct SupportRowLabel: View {
         .padding(.horizontal, 14).padding(.vertical, 12)
         .frame(minHeight: 56)
         .contentShape(Rectangle())
+    }
+}
+
+/// A ring feature the app can switch (see `SWITCHABLE_FEATURES` in oura-core).
+struct RingFeature: Identifiable {
+    let id: String
+    let icon: String
+    let title: String
+    let detail: String
+    static let all = [
+        RingFeature(id: "spo2", icon: "lungs", title: "Blood oxygen",
+                    detail: "Measured while you sleep. Uses more ring battery."),
+        RingFeature(id: "daytime_hr", icon: "heart", title: "Daytime heart rate",
+                    detail: "Readings through the day, not only overnight."),
+        RingFeature(id: "exercise_hr", icon: "figure.run", title: "Workout heart rate",
+                    detail: "Continuous heart rate during workouts. Uses more ring battery."),
+    ]
+}
+
+private struct RingFeatureRow: View {
+    let feature: RingFeature
+    /// The ring's mode for it; nil until a sync has read it.
+    let mode: Int?
+    let switching: Bool
+    let disabled: Bool
+    let onChange: (Bool) -> Void
+    var body: some View {
+        HStack(alignment: .center, spacing: 14) {
+            Image(systemName: feature.icon)
+                .font(.system(size: 15, weight: .regular))
+                .foregroundStyle(Obs.ink2)
+                .frame(width: 32, height: 32)
+                .background(Obs.paper.opacity(0.85), in: Circle())
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(feature.title).font(.subheadline.weight(.medium)).foregroundStyle(Obs.ink)
+                Text(mode == nil ? "Status shows after the next sync." : feature.detail)
+                    .font(.footnote).foregroundStyle(Obs.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            if switching {
+                ProgressView().controlSize(.small)
+                    .accessibilityLabel("Changing \(feature.title)")
+            } else {
+                Toggle(feature.title, isOn: Binding(get: { (mode ?? 0) != 0 }, set: onChange))
+                    .labelsHidden()
+                    .accessibilityHint(feature.detail)
+                    .disabled(disabled)
+            }
+        }
+        .padding(.horizontal, 14).padding(.vertical, 12)
+        .frame(minHeight: 56)
     }
 }
 
