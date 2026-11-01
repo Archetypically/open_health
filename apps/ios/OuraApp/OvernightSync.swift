@@ -58,6 +58,10 @@ enum OvernightSync {
 
     private static func handle(_ task: BGTask) {
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: lastLaunchKey)
+        // DiagStore files the previous session by its last lifecycle state, and a
+        // launch straight into the background never posts one: without this line every
+        // overnight run would surface the next morning as an "interrupted" incident.
+        dlog("lifecycle", "state=background (overnight task)")
         guard Keychain.loadKey() != nil else {
             // Nothing to drain with, and rescheduling would just wake the app all night.
             dlog("overnight", "launched but the ring key is unreadable; not rescheduling")
