@@ -826,7 +826,7 @@ struct RootView: View {
     @State private var isRefreshingSummary = false
     @State private var automaticSyncRequested = false
     @State private var reloadPending = false
-    @StateObject private var ring = RingSync()
+    @ObservedObject private var ring = RingSync.shared
     @StateObject private var modelProgress = ModelProgress()
     private func f(_ v: Double?, _ fallback: String = "–") -> String {
         v.map { "\(Int($0))" } ?? fallback
@@ -890,6 +890,7 @@ struct RootView: View {
                 requestAutomaticSync()
             } else if phase == .background {
                 WorkCoordinator.shared.invalidateAnalysis()
+                OvernightSync.schedule()
             }
         }
     }
@@ -1287,6 +1288,12 @@ struct BuildStamp: View {
 
 @main
 struct OuraApp: App {
-    init() { DiagStore.shared.bootstrap() }
+    init() {
+        DiagStore.shared.bootstrap()
+        // before launch finishes, as BGTaskScheduler requires; the overnight task may
+        // be what launched the app
+        OvernightSync.register()
+        Keychain.migrateAccessibility()
+    }
     var body: some Scene { WindowGroup { RootView() } }
 }

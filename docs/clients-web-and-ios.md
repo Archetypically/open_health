@@ -203,6 +203,10 @@ has no `illness`) and the ring-clock warnings (`clock.warnings`). Still iOS-only
 - **Direct reconnect to the remembered ring**: `BLETransport` asks iOS for the last
   synced ring by identifier alongside its scan, so a reconnect does not wait for a
   discovery report. Desktop `oura sync` (btleplug in `oura-link`) still scans every time.
+- **Overnight background sync** (`OvernightSync.swift`): a `BGProcessingTask` that iOS
+  runs only while the phone is idle and on power drains the ring a few times a night, so
+  the morning sync is small. The ring key is stored `AfterFirstUnlock` so the locked
+  phone can read it. The web has no equivalent: `oura sync` runs only on demand.
 - **Sync progress bar**: the sync card shows a percentage from the ring's per-batch
   `bytes_left`, measured against the largest value seen during the run. The web Sync
   button shows no progress.

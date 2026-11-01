@@ -88,6 +88,7 @@ targets:
       - path: Theme.swift
       - path: BLETransport.swift
       - path: RingSync.swift
+      - path: OvernightSync.swift
       - path: ProfileSettings.swift
       - path: EventStore.swift
       - path: ModelCache.swift

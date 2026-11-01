@@ -237,8 +237,15 @@ enum DB {
 }
 
 /// The ring auth key (exported from the desktop client) kept in the Keychain.
+///
+/// Readable after the first unlock since boot, not only while unlocked: the overnight
+/// sync (OvernightSync) runs with the phone locked on its charger, and the default
+/// `WhenUnlocked` class makes SecItemCopyMatching fail there with
+/// errSecInteractionNotAllowed. Not `ThisDeviceOnly`, so an encrypted backup still
+/// carries the key to a new phone, as it did before.
 enum Keychain {
     private static let account = "ring-auth-key"
+    private static let accessible = kSecAttrAccessibleAfterFirstUnlock
     static func saveKey(_ hex: String) {
         let data = Data(hex.utf8)
         let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
@@ -246,7 +253,20 @@ enum Keychain {
         SecItemDelete(base as CFDictionary)
         var add = base
         add[kSecValueData as String] = data
+        add[kSecAttrAccessible as String] = accessible
         SecItemAdd(add as CFDictionary, nil)
+    }
+    /// Move a key saved by an older build (default `WhenUnlocked`) to the class
+    /// above. Only succeeds while unlocked, so it runs at every launch; a no-op once
+    /// migrated or when there is no key.
+    static func migrateAccessibility() {
+        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                kSecAttrAccount as String: account]
+        let status = SecItemUpdate(q as CFDictionary,
+                                   [kSecAttrAccessible as String: accessible] as CFDictionary)
+        if status != errSecSuccess && status != errSecItemNotFound {
+            dlog("keychain", "accessibility migration deferred (status \(status))")
+        }
     }
     static func clearKey() {
         SecItemDelete([kSecClass as String: kSecClassGenericPassword,
@@ -309,6 +329,10 @@ final class SyncProgressBridge: SyncProgressListener, @unchecked Sendable {
 /// Orchestrates a sync and exposes progress to the UI.
 @MainActor
 final class RingSync: ObservableObject {
+    /// One instance for the UI and the overnight background task, so both see the
+    /// same `busy` flag and never open two links to the ring's single BLE slot.
+    static let shared = RingSync()
+
     @Published var status: String = ""
     @Published var busy = false
     @Published private(set) var exportStatus: String?
@@ -343,6 +367,10 @@ final class RingSync: ObservableObject {
     private var lastAutomaticAttemptAt: Date?
     private var markedIncompleteThisRun = false
     private var paused = false
+    /// The current run is the overnight one (`run(background: true)`). Its only stop
+    /// signal is the BG task's expiration; the app being backgrounded or the phone
+    /// locking, which stop a foreground run, are its normal state.
+    private var backgroundRun = false
     private var runID = ""
     private var attemptID = ""
     private var progressLogAt = 0.0
@@ -369,7 +397,7 @@ final class RingSync: ObservableObject {
         for name in [UIApplication.didEnterBackgroundNotification, UIApplication.protectedDataWillBecomeUnavailableNotification] {
             lifecycleObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 Task { @MainActor in
-                    guard let self, self.busy else { return }
+                    guard let self, self.busy, !self.backgroundRun else { return }
                     WorkCoordinator.shared.beginCleanup()
                     self.pause()
                 }
@@ -624,9 +652,31 @@ final class RingSync: ObservableObject {
         }
     }
 
+    /// Overnight sync from the BGProcessingTask: the app is in the background and the
+    /// phone usually locked, so this skips the foreground-only gates `run` normally
+    /// applies. A worn ring advertises only intermittently, hence the longer connect
+    /// budget; `pause()` (the task's expiration) stops it at the next checkpoint.
+    func runInBackground() async -> SyncReport? {
+        guard !busy else { dlog("sync", "overnight: skipped, a sync is already running"); return nil }
+        guard let key = Keychain.loadKey() else {
+            dlog("sync", "overnight: skipped, no readable ring key (none saved, or the phone has not been unlocked since boot)")
+            return nil
+        }
+        return await run(keyHex: key, maxAttempts: 3, source: "overnight",
+                         background: true, connectTimeout: 120)
+    }
+
+    /// `background` is only for `runInBackground`: it lets the run proceed while the
+    /// app is not active (WorkCoordinator.available would refuse it) and leaves the
+    /// idle timer alone, since there is no screen to keep awake.
     @discardableResult
-    func run(keyHex: String, maxAttempts: Int = 6, source: String = "manual") async -> SyncReport? {
+    func run(keyHex: String, maxAttempts: Int = 6, source: String = "manual",
+             background: Bool = false, connectTimeout: TimeInterval = 50) async -> SyncReport? {
         guard !busy else { return nil }
+        // Foreground runs stop when the app leaves the foreground; a background run
+        // stops only when paused (task expiration, or the app being backgrounded
+        // again after the user opened it mid-run).
+        let canWork = { background || WorkCoordinator.shared.available }
         connectionIssue = nil
         lastReport = nil   // clear any prior success so a failed retry isn't read as one
         lastProgressBytes = nil
@@ -642,21 +692,23 @@ final class RingSync: ObservableObject {
             status = "key must be 32 hex characters"
             return nil
         }
-        guard WorkCoordinator.shared.available else { status = "Sync paused. Open the app to resume."; return nil }
+        guard canWork() else { status = "Sync paused. Open the app to resume."; return nil }
         busy = true
         paused = false
+        backgroundRun = background
         WorkCoordinator.shared.invalidateAnalysis()
         await WorkGate.shared.acquire()
         defer { Task { await WorkGate.shared.release() }; WorkCoordinator.shared.endCleanup() }
-        guard !paused, WorkCoordinator.shared.available else { busy = false; return nil }
+        guard !paused, canWork() else { busy = false; backgroundRun = false; return nil }
         markedIncompleteThisRun = false
         // A multi-hour first sync must not die because the screen locked; SyncView
         // refreshes this when the app becomes active again.
-        IdleTimerLock.acquire("ring-sync")
+        if !background { IdleTimerLock.acquire("ring-sync") }
         defer {
             busy = false
+            backgroundRun = false
             syncFraction = nil
-            IdleTimerLock.release("ring-sync")
+            if !background { IdleTimerLock.release("ring-sync") }
             pump?.cancel()
             pump = nil
             // release the ring's single BLE link — holding it after the sync would
@@ -675,7 +727,7 @@ final class RingSync: ObservableObject {
         var attempt = 1
         var totalBudget = max(1, maxAttempts)
         while attempt <= totalBudget {
-            if paused || Task.isCancelled || !WorkCoordinator.shared.available { status = "Sync paused. Return to the app to resume."; return nil }
+            if paused || Task.isCancelled || !canWork() { status = "Sync paused. Return to the app to resume."; return nil }
             attemptID = UUID().uuidString
             dlog("sync", "attempt=\(attempt) id=\(attemptID) run=\(runID)")
             if attempt > 1 {
@@ -685,7 +737,7 @@ final class RingSync: ObservableObject {
                     status = "Connection lost. Retrying (\(attempt) of \(totalBudget))…"
                 }
                 do { try await Task.sleep(nanoseconds: delayNs) } catch { return nil }
-                guard !paused, WorkCoordinator.shared.available else { return nil }
+                guard !paused, canWork() else { return nil }
             }
 
             if excludedPeripherals.isEmpty {
@@ -699,7 +751,7 @@ final class RingSync: ObservableObject {
                                  excludedPeripheralIDs: excludedPeripherals)
             transport = t
             do {
-                try await t.connect()
+                try await t.connect(timeout: connectTimeout)
             } catch {
                 if paused { status = "Sync paused. Return to the app to resume."; return nil }
                 dlog("sync", "BLE connect FAILED: \(error)")
