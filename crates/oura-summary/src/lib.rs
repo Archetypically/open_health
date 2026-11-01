@@ -1543,13 +1543,25 @@ fn normalize_bed_periods(
                 - unix_s_at(previous.end_ds, previous.captured_unix);
             let same_epoch =
                 (wall_gap_s - raw_gap_ds as f64 / 10.0).abs() <= EPOCH_ALIGNMENT_SLACK_S;
-            if same_epoch
-                && raw_gap_ds <= MAX_BED_BREAK_DS
+            // Two records covering most of the same stretch are one sleep, however long
+            // the overlap: e.g. the ring's declared bedtime (21:52–08:01) beside the
+            // period derived from the nocturnal signals (21:50–08:14), which is not
+            // strictly inside it and so survives `beds_from_sleep_signal`. The overlap
+            // bound in `adjacent` is sized for an extended end running into the next record and
+            // kept those apart, so every night showed up twice — once with the HR/HRV
+            // samples, once empty — and an empty twin landing last blanked the digest,
+            // the HRV tile and the Symptom Radar.
+            let overlap_ds = previous.end_ds.min(period.end_ds) - period.start_ds;
+            let shorter_ds = (previous.end_ds - previous.start_ds)
+                .min(period.end_ds - period.start_ds)
+                .max(1);
+            let duplicate = overlap_ds * 2 >= shorter_ds;
+            let adjacent = raw_gap_ds <= MAX_BED_BREAK_DS
                 && wall_gap_s <= MAX_BED_BREAK_DS as f64 / 10.0
                 && raw_gap_ds >= -MAX_SLEEP_SIGNAL_EXTENSION_DS
                 && wall_gap_s >= -(MAX_SLEEP_SIGNAL_EXTENSION_DS as f64 / 10.0)
-                && !awake_throughout(previous.end_ds, period.start_ds)
-            {
+                && !awake_throughout(previous.end_ds, period.start_ds);
+            if same_epoch && (duplicate || adjacent) {
                 previous.end_ds = previous.end_ds.max(period.end_ds);
                 previous.raw_start_ds = previous.raw_start_ds.min(period.raw_start_ds);
                 previous.raw_end_ds = previous.raw_end_ds.max(period.raw_end_ds);
@@ -3469,6 +3481,84 @@ mod tests {
         let value = sleep_debt_summary(&sleep);
         assert_eq!(value["valid"], false);
         assert_eq!(value["valid_days"], 4);
+    }
+
+    #[test]
+    fn overlapping_records_of_one_night_merge_into_one() {
+        // Shape of a real Ring 4 night: the declared bedtime 21:52–08:01 beside the
+        // signal-derived period 21:50–08:14, which overhangs it at both ends.
+        let min = 60 * 10;
+        let declared = bed(2 * min, (10 * 60 + 11) * min);
+        let derived = bed(0, (10 * 60 + 24) * min);
+        let got = normalize_bed_periods(vec![declared, derived], &[], &[], &[], |ds, _| {
+            ds as f64 / 10.0
+        });
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!((got[0].start_ds, got[0].end_ds), (0, (10 * 60 + 24) * min));
+    }
+
+    #[test]
+    fn a_nap_beside_the_night_stays_separate() {
+        let hour = 3600 * 10;
+        let secs = |ds: i64, _: i64| ds as f64 / 10.0;
+        // a two-hour gap is a separate sleep
+        let got = normalize_bed_periods(
+            vec![bed(0, 8 * hour), bed(10 * hour, 11 * hour)],
+            &[],
+            &[],
+            &[],
+            secs,
+        );
+        assert_eq!(got.len(), 2, "{got:?}");
+        // overlapping by less than half of the shorter record, and by more than the
+        // extension bound, is not a duplicate either
+        let got = normalize_bed_periods(
+            vec![bed(0, 10 * hour), bed(6 * hour, 17 * hour)],
+            &[],
+            &[],
+            &[],
+            secs,
+        );
+        assert_eq!(got.len(), 2, "{got:?}");
+    }
+
+    #[test]
+    fn a_record_inside_the_night_merges_and_keeps_the_staged_flag() {
+        let hour = 3600 * 10;
+        let staged = BedPeriod {
+            staged: true,
+            ..bed(hour, 12 * hour)
+        };
+        let got = normalize_bed_periods(
+            vec![bed(0, 10 * hour), staged, bed(2 * hour, 3 * hour)],
+            &[],
+            &[],
+            &[],
+            |ds, _| ds as f64 / 10.0,
+        );
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!((got[0].start_ds, got[0].end_ds), (0, 12 * hour));
+        assert_eq!((got[0].raw_start_ds, got[0].raw_end_ds), (0, 12 * hour));
+        assert!(got[0].staged);
+    }
+
+    #[test]
+    fn overlapping_records_from_different_epochs_stay_separate() {
+        // the same raw deciseconds, but a reboot between them: the wall clock says the
+        // second record is days later, so the raw overlap is not real
+        let hour = 3600 * 10;
+        let rebooted = BedPeriod {
+            captured_unix: 1 + 3 * 86_400,
+            ..bed(0, 8 * hour)
+        };
+        let got = normalize_bed_periods(
+            vec![bed(0, 8 * hour), rebooted],
+            &[],
+            &[],
+            &[],
+            |ds, captured| ds as f64 / 10.0 + captured as f64,
+        );
+        assert_eq!(got.len(), 2, "{got:?}");
     }
 
     #[test]
