@@ -176,7 +176,7 @@ struct ProfileSettingsView: View {
             }
             .scrollContentBackground(.hidden)
             .background(Obs.canvas.ignoresSafeArea())
-            .navigationTitle("profile")
+            .navigationTitle("Profile")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
