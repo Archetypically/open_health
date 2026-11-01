@@ -1,0 +1,69 @@
+# Keep evan/customizations rebased on upstream (Th0rgal/open_health main).
+#
+# Fork-only. Rebases our commits onto upstream/main and force-pushes when upstream
+# has moved; that push is what sets off the Xcode Cloud → TestFlight workflow.
+# A conflict aborts the rebase and fails the run (GitHub emails you); nothing is
+# pushed, so resolve it by hand as usual — see apps/ios/XCODE_CLOUD.md.
+#
+# Needs the UPSTREAM_SYNC_TOKEN secret: a fine-grained PAT on this repo with
+# Contents + Workflows write. The built-in GITHUB_TOKEN can't push commits that
+# touch .github/workflows/, which upstream changes arrive with.
+name: Sync upstream
+on:
+  schedule:
+    - cron: "17 9 * * *" # daily, 09:17 UTC
+  workflow_dispatch:
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  rebase:
+    # never run in upstream or in anyone else's fork
+    if: github.repository == 'Archetypically/open_health'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      BRANCH: evan/customizations
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/Th0rgal/open_health.git
+          git fetch --no-tags upstream main
+
+      - name: Rebase onto upstream/main
+        id: rebase
+        run: |
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already on top of upstream/main ($(git rev-parse --short upstream/main)); nothing to do."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "before=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Upstream commits coming in:"
+          git log --oneline HEAD..upstream/main
+          # rebase rewrites committer, not author, so this only stamps who replayed it
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          if ! git rebase upstream/main; then
+            echo "::error::Rebase of $BRANCH onto upstream/main conflicts; resolve it locally."
+            git status --short
+            git rebase --abort
+            exit 1
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Push
+        if: steps.rebase.outputs.changed == 'true'
+        run: |
+          # lease on the sha we rebased: if you pushed meanwhile, this refuses
+          # rather than discarding your commit
+          git push --force-with-lease="$BRANCH:${{ steps.rebase.outputs.before }}" origin "HEAD:$BRANCH"
+          echo "Pushed $(git rev-parse --short HEAD); Xcode Cloud picks it up from here."

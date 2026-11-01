@@ -78,6 +78,15 @@ Rebasing keeps your commits linear instead of accumulating merge commits. The
 trade-off: an auto-synced `main` never goes through CI, so upstream commits land
 unbuilt — only your pushes to `evan/customizations` are verified by a build.
 
+`.github/workflows/sync-upstream.yml` does that rebase for you, daily and on manual
+dispatch: it force-pushes only when upstream moved, and that push starts the TestFlight
+workflow. A conflict fails the run without pushing — then rebase by hand as above.
+It depends on three fork settings: `evan/customizations` is the **default branch**
+(scheduled workflows only run from it), Actions are enabled, and the
+`UPSTREAM_SYNC_TOKEN` secret holds a fine-grained PAT scoped to this repo with
+**Contents** and **Workflows** write (the built-in token cannot push commits that
+touch `.github/workflows/`). The PAT expires — rotate it before then.
+
 ## Build numbers
 
 Never hardcode `CURRENT_PROJECT_VERSION` in a CI spec. TestFlight rejects a build
